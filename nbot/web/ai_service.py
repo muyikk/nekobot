@@ -848,7 +848,7 @@ def _get_tool_display_name(tool_name: str) -> str:
         "get_weather": "天气查询",
         "get_date_time": "日期时间",
         "http_get": "HTTP 请求",
-        "understand_image": "图片理解",
+        # "understand_image": "图片理解",  # 已废弃：由 MessagePreprocessor 预处理管线统一处理
         "exec_command": "命令执行",
         "download_file": "文件下载",
         "save_to_memory": "保存记忆",

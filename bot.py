@@ -58,6 +58,15 @@ def _get_commands_module():
     global _commands_module
     if _commands_module is None:
         _commands_module = importlib.import_module("nbot.commands")
+        # 加载插件（需在 commands 注册后才能加载）
+        try:
+            importlib.import_module("nbot.plugins.bilibili_parser")
+        except Exception as e:
+            _log.warning(f"BilibiliParser 插件加载失败: {e}")
+        try:
+            importlib.import_module("nbot.plugins.douyin_parser")
+        except Exception as e:
+            _log.warning(f"DouyinParser 插件加载失败: {e}")
     return _commands_module
 
 

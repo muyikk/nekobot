@@ -4,8 +4,11 @@ import os
 import base64
 import json
 import io
+import logging
 from PIL import Image
 import imageio.v2 as imageio
+
+_log = logging.getLogger(__name__)
 from nbot.core import (
     build_chat_completion_payload,
     normalize_chat_completion_data,
@@ -283,7 +286,7 @@ class AIClient:
                 data = response_json_utf8(resp)
 
                 if not data.get("choices"):
-                    print(f"[DEBUG] API响应没有choices: {data}")
+                    _log.warning(f"[DEBUG] API响应没有choices: {data}")
 
                 normalized = normalize_chat_completion_data(
                     data,
@@ -403,15 +406,15 @@ class AIClient:
         return response
 
     def describe_image(self, image_url: str, text: str = None) -> str:
-        print(f"[图片识别] 开始识别图片, URL: {image_url[:80]}{'...(base64已省略)' if image_url.startswith('data:') and len(image_url) > 80 else ''}")
+        _log.info(f"[图片识别] 开始识别图片, URL: {image_url[:80]}{'...(base64已省略)' if image_url.startswith('data:') and len(image_url) > 80 else ''}")
 
         # 获取图片理解模型配置
         vision_config = get_vision_model_config()
         if vision_config and vision_config.get("api_key"):
             # 使用配置的图片理解模型
             api_key = vision_config.get("api_key")
-            base_url = vision_config.get("base_url", "")
-            model = vision_config.get("model", "zai-org/GLM-4.6V")
+            base_url = vision_config.get("base_url", "https://open.bigmodel.cn/api/paas/v4/chat/completions")
+            model = vision_config.get("model", "glm-4.6V")
             provider_type = vision_config.get("provider_type", "openai_compatible")
             system_prompt = vision_config.get("system_prompt", "请详细描述这张图片的内容。")
             
@@ -446,10 +449,10 @@ class AIClient:
                 response = requests.post(url, json=payload, headers=headers, timeout=60)
                 response.raise_for_status()
                 result = self.clean_response(response_json_utf8(response)["choices"][0]["message"]["content"])
-                print(f"[图片识别] 识别成功(使用配置模型), 结果: {result[:100]}...")
+                _log.info(f"[图片识别] 识别成功(使用配置模型), 结果: {result[:100]}...")
                 return result
             except Exception as e:
-                print(f"[图片识别] 使用配置模型失败, 回退到默认模型: {e}")
+                _log.warning(f"[图片识别] 使用配置模型失败, 回退到默认模型: {e}")
         
         # 回退到默认的silicon_chat
         messages = [
@@ -464,10 +467,10 @@ class AIClient:
         response = self.silicon_chat(self.pic_model, messages)
         try:
             result = self.clean_response(response_json_utf8(response)["choices"][0]["message"]["content"])
-            print(f"[图片识别] 识别成功, 结果: {result[:100]}...")
+            _log.info(f"[图片识别] 识别成功, 结果: {result[:100]}...")
             return result
         except Exception as e:
-            print(f"[图片识别] 识别失败, 错误: {e}, 响应: {response.text}")
+            _log.error(f"[图片识别] 识别失败, 错误: {e}, 响应: {response.text}")
             return "链接失效"
 
     def gif_to_mp4_data_url(self, image_url: str, fps: int = 10) -> str:
@@ -607,10 +610,10 @@ class AIClient:
         try:
             response = self.silicon_chat("Qwen/Qwen2.5-7B-Instruct", messages)
             result = response_json_utf8(response)
-            print(f"[DEBUG] should_search API响应: {result}")
+            _log.debug(f"[DEBUG] should_search API响应: {result}")
             return int(self.clean_response(result["choices"][0]["message"]["content"])) == 1
         except Exception as e:
-            print(f"[DEBUG] should_search 错误: {e}")
+            _log.debug(f"[DEBUG] should_search 错误: {e}")
             return False
 
     def should_reply(self, content: str) -> float:
@@ -653,7 +656,7 @@ class AIClient:
             return ""
 
     def describe_video(self, video_url: str, text: str = None) -> str:
-        print(f"[视频识别] 开始识别视频, URL: {video_url[:80]}{'...(base64已省略)' if video_url.startswith('data:') and len(video_url) > 80 else ''}")
+        _log.info(f"[视频识别] 开始识别视频, URL: {video_url[:80]}{'...(base64已省略)' if video_url.startswith('data:') and len(video_url) > 80 else ''}")
         
         # 获取视频理解模型配置
         video_config = get_video_model_config()
@@ -692,10 +695,10 @@ class AIClient:
             response = requests.post(url, json=payload, headers=headers, timeout=120)
             response.raise_for_status()
             result = self.clean_response(response_json_utf8(response)["choices"][0]["message"]["content"])
-            print(f"[视频识别] 识别成功, 结果: {result[:100]}...")
+            _log.info(f"[视频识别] 识别成功, 结果: {result[:100]}...")
             return result
         except Exception as e:
-            print(f"[视频识别] 识别失败: {e}")
+            _log.error(f"[视频识别] 识别失败: {e}")
             return f"链接失效,错误: {str(e)}"
 
 

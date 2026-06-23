@@ -1833,6 +1833,75 @@ async def handle_st(msg, is_group=True):
     res = requests.get(f"https://api.lolicon.app/setu/v2?tag={tags}").json().get("data")[0].get("urls").get("original")
     await handle_generic_file(msg, is_group,"","image",custom_url=res)  # 特殊处理API调用
 
+
+def _parse_loli_params(raw: str):
+    """解析 /loli 和 /r18 命令参数
+
+    纯数字 → num，其他字符 → tag（可用 & 组合）
+    示例: "初音未来 3" → tag="初音未来", num=3
+          "初音未来&和服" → tag="初音未来&和服", num=1
+          "5" → tag="", num=5
+    """
+    tag = ""
+    num = 1
+    for p in raw.strip().split():
+        if p.isdigit():
+            num = max(1, min(int(p), 10))
+        else:
+            if tag:
+                tag += " " + p
+            else:
+                tag = p
+    return tag, num
+
+
+@register_command("/loli", help_text="/loli [标签] [数量] -> 获取安全涩图(r18=0), 标签可用&组合, 如: /loli 初音未来&和服 3", category="3")
+async def handle_loli(msg, is_group=True):
+    tag, num = _parse_loli_params(msg.raw_message[len("/loli"):])
+    try:
+        params = {"r18": 0, "num": num, "size": "original"}
+        if tag:
+            params["tag"] = tag
+        data = requests.get("https://api.lolicon.app/setu/v2", params=params, timeout=30).json()
+        if data.get("error"):
+            await msg.reply(text=f"获取失败: {data['error']}")
+            return
+        items = data.get("data") or []
+        if not items:
+            await msg.reply(text="没有找到匹配的图片喵~")
+            return
+        for item in items:
+            img_url = item.get("urls", {}).get("original")
+            if img_url:
+                await handle_generic_file(msg, is_group, "", "image", custom_url=img_url)
+    except Exception as e:
+        _log.error(f"/loli 失败: {e}")
+        await msg.reply(text=f"获取失败喵~ {e}")
+
+
+@register_command("/r18", help_text="/r18 [标签] [数量] -> 获取R18涩图(r18=1), 标签可用&组合, 如: /r18 萝莉 5", category="3")
+async def handle_r18(msg, is_group=True):
+    tag, num = _parse_loli_params(msg.raw_message[len("/r18"):])
+    try:
+        params = {"r18": 1, "num": num, "size": "original"}
+        if tag:
+            params["tag"] = tag
+        data = requests.get("https://api.lolicon.app/setu/v2", params=params, timeout=30).json()
+        if data.get("error"):
+            await msg.reply(text=f"获取失败: {data['error']}")
+            return
+        items = data.get("data") or []
+        if not items:
+            await msg.reply(text="没有找到匹配的图片喵~")
+            return
+        for item in items:
+            img_url = item.get("urls", {}).get("original")
+            if img_url:
+                await handle_generic_file(msg, is_group, "", "image", custom_url=img_url)
+    except Exception as e:
+        _log.error(f"/r18 失败: {e}")
+        await msg.reply(text=f"获取失败喵~ {e}")
+
 @register_command("/random_video","/rv",help_text = "/random_video 或者 /rv -> 随机二次元视频",category = "3")
 async def handle_random_video(msg, is_group=True):
     await handle_generic_file(msg, is_group, 'rv', 'video')
@@ -4325,16 +4394,159 @@ async def dispatch_message(msg, is_group: bool):
                 image_url = first_elem.data.get('url')
                 if image_url:
                     _log.info(f"从 message[0].data.url 获取图片 URL: {image_url[:50]}...")
+                else:
+                    _log.warning(f"message[0].type=image 但 data.url 为空, data keys={list(first_elem.data.keys()) if hasattr(first_elem, 'data') and hasattr(first_elem.data, 'keys') else 'N/A'}")
+            else:
+                elem_type = first_elem.type if hasattr(first_elem, 'type') else type(first_elem).__name__
+                _log.debug(f"message[0].type={elem_type}, 非图片消息, 不提取图片URL")
+        else:
+            _log.debug(f"msg 无 message 属性或为空, hasattr(message)={hasattr(msg, 'message')}, message={msg.message if hasattr(msg, 'message') else 'N/A'}")
     except Exception as e:
         _log.warning(f"无法从 message 获取图片 URL: {e}")
 
     # 如果上面获取失败，尝试解析 CQ 码
     if not image_url:
         import re
-        image_match = re.search(r'\[CQ:image[^,]*url=(https?://[^,\]]+)', raw_msg)
+        # [CQ:image,file=...,sub_type=0,url=https://...] — url= 可能后有其他字段
+        # 使用 [^,\]]+ 在遇到 , 或 ] 时截断，防止吞入后续字段
+        image_match = re.search(r'\[CQ:image\b.*?url=(https?://[^,\]]+)', raw_msg)
         if image_match:
             image_url = image_match.group(1)
             _log.info(f"从 CQ 码解析图片 URL: {image_url[:50]}...")
+        else:
+            # 只有 raw_msg 看起来像包含图片时才警告（避免纯文本消息的噪音日志）
+            if 'CQ:image' in raw_msg or '[图片]' in raw_msg or 'image' in raw_msg.lower():
+                _log.warning(f"消息疑似包含图片但未能提取URL, raw_msg={raw_msg[:200]}")
+
+    # 修复 HTML 实体编码（新版 QQ 协议的 URL 中 & 会被编码为 &amp; 等）
+    if image_url:
+        from html import unescape
+        unescaped = unescape(image_url)
+        if unescaped != image_url:
+            _log.info(f"URL HTML 实体已修复: &amp; → &")
+            image_url = unescaped
+
+    # 获取视频 URL
+    # 参考图片获取方式：优先 msg.message[].data 中的 url/file_id，回退 CQ 码正则
+    # QQ 视频消息的 data 包含 file（文件名）、url（本地路径）、可能还有 file_id（用于 API 下载）
+    video_url = None
+    video_file_id = None
+    try:
+        if hasattr(msg, 'message') and msg.message:
+            for i, elem in enumerate(msg.message):
+                elem_type = elem.type if hasattr(elem, 'type') else None
+                _log.info(f"  msg.message[{i}].type={elem_type}, has_data={hasattr(elem, 'data')}")
+                if elem_type == 'video':
+                    if hasattr(elem, 'data'):
+                        data_dict = dict(elem.data) if hasattr(elem.data, 'items') else {}
+                        _log.info(f"  视频元素 data: {json.dumps(data_dict, ensure_ascii=False, default=str)[:500]}")
+                        video_file_id = data_dict.get('file_id') or data_dict.get('file_unique') or data_dict.get('id')
+                    video_url = elem.data.get('url') or elem.data.get('file') or elem.data.get('path')
+                    if video_url:
+                        _log.info(f"从 message[{i}] 获取视频路径: {video_url[:100]}")
+                    if not video_url and video_file_id:
+                        _log.info(f"message[{i}] 视频无本地路径, 但有 file_id={video_file_id}, 将通过 API 下载")
+                    break
+    except Exception as e:
+        _log.warning(f"无法从 message 获取视频数据: {e}")
+        import traceback as _tb
+        _log.info(_tb.format_exc())
+
+    # CQ 码正则回退
+    if not video_url and not video_file_id:
+        import re
+        # [CQ:video,file=xxx.mp4,url=/local/path/xxx.mp4,file_size=...]
+        video_match = re.search(r'\[CQ:video\b.*?url=([^,\]]+)', raw_msg)
+        if video_match:
+            video_url = video_match.group(1)
+            _log.info(f"从 CQ 码 url= 提取到视频路径: {video_url[:100]}")
+        else:
+            video_match = re.search(r'\[CQ:video\b.*?file=([^,\]]+)', raw_msg)
+            if video_match:
+                video_url = video_match.group(1)
+                _log.info(f"从 CQ 码 file= 提取到视频文件名: {video_url[:100]}（仅有文件名）")
+
+    # 视频本地文件 → base64 data URL
+    # 参考图片：图片 URL 是 QQ CDN 的 HTTP 地址，可直接下载。视频是本地路径，需自己转换。
+    if video_url and not video_file_id:
+        from html import unescape
+        video_url = unescape(video_url)
+        _log.info(f"[视频] HTML 实体修复后: {video_url[:100]}")
+        if video_url.startswith("http://") or video_url.startswith("https://"):
+            _log.info(f"[视频] 远程 URL，直接使用")
+        else:
+            # 本地路径：尝试直接读取 → 失败则用 NapCat API 通过 file_id 下载
+            _log.info(f"[视频] 检测到本地文件路径，尝试转为 base64...")
+            import base64 as _b64
+            video_read = None
+            # 方式 A：直接读本地文件
+            try:
+                if os.path.exists(video_url):
+                    file_size = os.path.getsize(video_url)
+                    _log.info(f"[视频] 文件存在, 大小: {file_size//1024}KB")
+                    with open(video_url, "rb") as _f:
+                        video_read = _f.read()
+                else:
+                    _log.warning(f"[视频] 本地文件不存在（可能因 macOS 沙盒限制）: {video_url}")
+            except Exception as e:
+                _log.warning(f"[视频] 直接读取失败: {e}")
+
+            # 方式 B：尝试通过 NapCat WebSocket API 下载（如文件路径在 NapCat 可访问范围内）
+            if not video_read:
+                _log.info(f"[视频] 尝试通过 NapCat 协议下载文件...")
+                try:
+                    # NapCat 内部可访问 QQ 缓存，尝试通过 WebSocket 获取文件
+                    # 将本地路径作为参数传递给 NapCat
+                    import base64 as _b64_inner
+                    loop = asyncio.get_event_loop()
+                    # 尝试 get_file action（某些 NapCat 版本支持 file 参数）
+                    result = await bot.api._http.post("get_file", {"file": video_url})
+                    _log.info(f"[视频] NapCat API 响应: {json.dumps(result, ensure_ascii=False)[:300]}")
+                    if result and result.get("status") == "ok":
+                        file_data = result.get("data", {})
+                        if file_data.get("base64"):
+                            video_read = _b64_inner.b64decode(file_data["base64"])
+                        elif file_data.get("url"):
+                            # 如果是 HTTP URL，直接使用
+                            video_url = file_data["url"]
+                            video_read = b'__HTTP_URL__'
+                except Exception as e:
+                    _log.warning(f"[视频] NapCat API 下载失败: {e}")
+
+            if video_read and video_read != b'__HTTP_URL__':
+                _ext = os.path.splitext(video_url)[1].lower() if '.' in video_url else '.mp4'
+                _mime_map = {'.mp4': 'video/mp4', '.avi': 'video/x-msvideo', '.mov': 'video/quicktime', '.webm': 'video/webm'}
+                _mime = _mime_map.get(_ext, 'video/mp4')
+                _video_b64 = _b64.b64encode(video_read).decode("utf-8")
+                video_url = f"data:{_mime};base64,{_video_b64}"
+                _log.info(f"[视频] 已转 base64 data URL, 大小: {len(_video_b64)//1024}KB")
+            elif video_read == b'__HTTP_URL__':
+                _log.info(f"[视频] 使用 API 返回的 HTTP URL")
+            else:
+                _log.warning(f"[视频] 无法获取视频内容，video_url 置空")
+                video_url = None
+
+    # 有 file_id 但无文件内容时，尝试通过 NapCat API 获取
+    if video_file_id and not video_url:
+        _log.info(f"[视频] 尝试通过 file_id={video_file_id} 下载...")
+        try:
+            result = await bot.api._http.post("get_file", {"file_id": video_file_id})
+            _log.info(f"[视频] NapCat get_file 响应: {json.dumps(result, ensure_ascii=False)[:300]}")
+            if result and result.get("status") == "ok":
+                file_data = result.get("data", {})
+                if file_data.get("url"):
+                    video_url = file_data["url"]
+                    _log.info(f"[视频] 通过 file_id 获取到 URL: {video_url[:100]}")
+                elif file_data.get("base64"):
+                    import base64 as _b64
+                    video_read = _b64.b64decode(file_data["base64"])
+                    _video_b64 = _b64.b64encode(video_read).decode("utf-8")
+                    video_url = f"data:video/mp4;base64,{_video_b64}"
+                    _log.info(f"[视频] 通过 file_id 转 base64, 大小: {len(_video_b64)//1024}KB")
+        except Exception as e:
+            _log.warning(f"[视频] file_id 下载失败: {e}")
+    else:
+        _log.info(f"[视频] 未能提取到视频, video_url={video_url is not None}, video_file_id={video_file_id is not None}, raw_msg前200={raw_msg[:200]}")
 
     # 检测并保存用户上传的文件到工作区
     if WORKSPACE_AVAILABLE:
@@ -4342,6 +4554,24 @@ async def dispatch_message(msg, is_group: bool):
             _save_incoming_files_to_workspace(msg, is_group)
         except Exception as e:
             _log.warning(f"保存文件到工作区失败: {e}")
+
+    # B站链接检测（小程序分享 / BV号 / AV号 / b23.tv 短链）
+    try:
+        from nbot.plugins.bilibili_parser import on_bilibili_message
+        handled = await on_bilibili_message(msg, is_group)
+        if handled:
+            return
+    except Exception as e:
+        _log.warning(f"B站链接检测失败: {e}")
+
+    # 抖音链接检测（v.douyin.com 短链 / 小程序分享 / douyin.com/video）
+    try:
+        from nbot.plugins.douyin_parser import on_douyin_message
+        handled = await on_douyin_message(msg, is_group)
+        if handled:
+            return
+    except Exception as e:
+        _log.warning(f"抖音链接检测失败: {e}")
 
     # 检查是否是命令
     for commands, handler in command_handlers.items():
@@ -4384,8 +4614,10 @@ async def dispatch_message(msg, is_group: bool):
         try:
             content = raw_msg
             atts = [{"type": "image", "url": image_url, "source": "qq"}] if image_url else []
+            if video_url:
+                atts.append({"type": "video", "url": video_url, "source": "qq"})
             trigger = "at bot" if at_bot else f"auto_reply level={auto_reply_level:.2f}"
-            _log.info(f"Processing group message ({trigger}) from {user_id} in {group_id}: {content[:50]}..., image: {bool(image_url)}")
+            _log.info(f"Processing group message ({trigger}) from {user_id} in {group_id}: {content[:50]}..., image: {bool(image_url)}, video: {bool(video_url)}")
 
             # 如果是 auto_reply 模式（非@机器人），获取群聊最近消息作为上下文
             if not at_bot and auto_reply_enabled and group_id:
@@ -4420,7 +4652,9 @@ async def dispatch_message(msg, is_group: bool):
             content = raw_msg
             user_id = str(msg.user_id) if hasattr(msg, 'user_id') else None
             atts = [{"type": "image", "url": image_url, "source": "qq"}] if image_url else []
-            _log.info(f"Processing private message from {user_id}: {content[:50]}..., image: {bool(image_url)}")
+            if video_url:
+                atts.append({"type": "video", "url": video_url, "source": "qq"})
+            _log.info(f"Processing private message from {user_id}: {content[:50]}..., image: {bool(image_url)}, video: {bool(video_url)}")
             response = await loop.run_in_executor(None, do_chat, content, user_id, None, None, False, None, None, atts)
             if response:
                 _log.info(f"Sending private reply: {response[:50]}...")

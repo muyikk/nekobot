@@ -98,6 +98,7 @@ class MessagePreprocessor:
         """处理 ChatRequest.attachments，将媒体描述注入 content。"""
         attachments = getattr(chat_request, "attachments", None)
         if not attachments:
+            _log.debug(f"Preprocessor: no attachments in chat_request, skipping. hasattr={hasattr(chat_request, 'attachments')}, channel={getattr(chat_request, 'channel', 'unknown')}")
             return
 
         descriptions = []

@@ -746,81 +746,15 @@ class ToolExecutor:
             "timestamp": now.isoformat()
         }
 
-    @staticmethod
-    def understand_image(prompt: str, image_source: str) -> Dict[str, Any]:
-        """
-        图片理解（使用 MiniMax VLM API）
-        
-        Args:
-            prompt: 询问图片的问题
-            image_source: 图片URL或本地文件路径
-        """
-        try:
-            # 检查配置
-            api_key = get_minimax_api_key()
-            if not api_key:
-                _log.error("MiniMax API密钥未配置")
-                return {
-                    "success": False,
-                    "error": "MiniMax API密钥未配置"
-                }
-            
-            # 处理图片源
-            processed_image_url = process_image_url(image_source)
-            
-            # 构建请求
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}"
-            }
-            
-            payload = {
-                "prompt": prompt,
-                "image_url": processed_image_url
-            }
-            
-            _log.info("[VLM] 发送图片理解请求")
-            _log.info(f"[VLM] Prompt: {prompt[:100]}{'...' if len(prompt) > 100 else ''}")
-            _log.info(f"[VLM] Image: {image_source[:100]}{'...' if len(image_source) > 100 else ''}")
-            
-            # 发送请求
-            import requests
-            response = requests.post(MINIMAX_VLM_URL, headers=headers, json=payload, timeout=60)
-            response.raise_for_status()
-            
-            # 解析响应
-            result = response.json()
-            
-            _log.info(f"[VLM] API响应: {json.dumps(result, ensure_ascii=False)[:300]}")
-            
-            # 提取理解结果
-            content = result.get("content", "")
-            
-            if not content:
-                return {
-                    "success": False,
-                    "error": "图片理解返回结果为空"
-                }
-            
-            return {
-                "success": True,
-                "content": content,
-                "image_source": image_source,
-                "prompt": prompt
-            }
-            
-        except requests.exceptions.RequestException as e:
-            _log.error(f"[VLM] 请求错误: {e}")
-            return {
-                "success": False,
-                "error": f"图片理解请求失败: {str(e)}"
-            }
-        except Exception as e:
-            _log.error(f"[VLM] 图片理解错误: {e}")
-            return {
-                "success": False,
-                "error": str(e)
-            }
+    # @staticmethod
+    # def understand_image(prompt: str, image_source: str) -> Dict[str, Any]:
+    #     """
+    #     图片理解（使用 MiniMax VLM API）
+    #     已废弃：图片理解由 MessagePreprocessor 预处理管线统一处理，
+    #     在消息到达 AI 模型之前自动调用 describe_image() 完成图片→文字转换。
+    #     AI 模型收到的消息中已无图片 URL，因此此 tool 不会被触发。
+    #     """
+    #     ...
 
     @staticmethod
     def http_get(url: str) -> Dict[str, Any]:
@@ -1334,27 +1268,27 @@ TOOL_DEFINITIONS = [
             }
         }
     },
-    {
-        "type": "function",
-        "function": {
-            "name": "understand_image",
-            "description": "图片理解工具。当用户发送图片并询问相关内容时使用此工具，可以分析图片内容、识别物体、描述场景等。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": "询问图片的问题，如'这张图片里有什么'、'描述一下这个场景'等"
-                    },
-                    "image_source": {
-                        "type": "string",
-                        "description": "图片的URL地址或本地文件路径"
-                    }
-                },
-                "required": ["prompt", "image_source"]
-            }
-        }
-    },
+    # {
+    #     "type": "function",
+    #     "function": {
+    #         "name": "understand_image",
+    #         "description": "图片理解工具。当用户发送图片并询问相关内容时使用此工具，可以分析图片内容、识别物体、描述场景等。已废弃：图片理解由 MessagePreprocessor 预处理管线统一处理。",
+    #         "parameters": {
+    #             "type": "object",
+    #             "properties": {
+    #                 "prompt": {
+    #                     "type": "string",
+    #                     "description": "询问图片的问题，如'这张图片里有什么'、'描述一下这个场景'等"
+    #                 },
+    #                 "image_source": {
+    #                     "type": "string",
+    #                     "description": "图片的URL地址或本地文件路径"
+    #                 }
+    #             },
+    #             "required": ["prompt", "image_source"]
+    #         }
+    #     }
+    # },
     {
         "type": "function",
         "function": {
@@ -1837,7 +1771,7 @@ def execute_tool(tool_name: str, arguments: Dict[str, Any], context: Dict = None
             "search_web": executor.search_web,
             "get_date_time": executor.get_date_time,
             "http_get": executor.http_get,
-            "understand_image": executor.understand_image,
+            # "understand_image": executor.understand_image,  # 已废弃：由 MessagePreprocessor 预处理管线统一处理
             "exec_command": executor.exec_command,
             "get_session_thinking_history": executor.get_session_thinking_history,
         }

@@ -907,13 +907,24 @@ class AIPipeline:
         except Exception as e:
             error_str = str(e)
             _log.error(f"Tool loop failed: {e}")
-            # 如果是 400 错误（如模型不支持工具调用），回退到普通对话
+            # 400：模型不支持工具调用 → 去掉工具回退到普通对话
             if "400" in error_str and ("Bad Request" in error_str or "chat/completions" in error_str):
                 _log.warning("模型返回400错误，跳过工具调用，回退到普通对话")
                 progress.on_thinking_start(ctx)
                 self._run_simple(ctx, callbacks)
                 progress.on_done(ctx)
                 return
+            # 5xx / timeout / connection：服务端临时故障 → 去掉工具重试一次普通对话
+            if any(x in error_str for x in ("502", "503", "504", "520", "timeout", "Timeout", "Connection")):
+                _log.warning(f"服务端错误({error_str[:80]})，跳过工具调用，回退到普通对话")
+                try:
+                    progress.on_thinking_start(ctx)
+                    self._run_simple(ctx, callbacks)
+                    progress.on_done(ctx)
+                    return
+                except Exception as retry_err:
+                    _log.error(f"回退普通对话也失败: {retry_err}")
+                    error_str = str(retry_err)
             ctx.error = error_str
             ctx.final_content = f"工具循环执行失败: {error_str}"
             return

@@ -1,0 +1,13 @@
+**/__pycache__/
+cache
+logs
+saved_message
+.env
+admin.txt
+switches.json
+.DS_Store
+data
+resources
+**/tmp/
+nbot/plugins/bilibili
+!resources/prompts/
