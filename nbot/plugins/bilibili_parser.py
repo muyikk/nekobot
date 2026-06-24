@@ -9,6 +9,7 @@ BilibiliParser - B站视频解析插件
 """
 import re
 import os
+import base64
 import json
 import html
 import ssl
@@ -23,6 +24,8 @@ from io import BytesIO
 from cryptography.fernet import Fernet
 
 from nbot.commands import register_command, command_handlers, bot
+from ncatbot.core import MessageChain
+from ncatbot.core.element import Image, Text
 
 _log = logging.getLogger(__name__)
 
@@ -368,45 +371,37 @@ async def _process_video(msg, is_group, video_id: str):
                     f"收藏: {stats.get('favorite', 0)} | 投币: {stats.get('coin', 0)}"
                 )
 
-                # 下载封面图并发送
-                cover_path = None
+                # 封面图：B 站 CDN 要求 Referer 头，QQ bot 后端不带 → 403 Forbidden。
+                # 我们下载到内存后 base64 编码，塞进消息里——不需本地文件也不靠 bot 后端拉。
+                elements = []
                 if cover_url:
                     if cover_url.startswith("//"):
                         cover_url = "https:" + cover_url
-                    if not os.path.exists(_TMP_DIR):
-                        os.makedirs(_TMP_DIR, exist_ok=True)
-                    safe_vid = video_id.replace("=", "_")
-                    local_cover = os.path.abspath(
-                        os.path.join(_TMP_DIR, f"cover_{safe_vid}.jpg")
-                    )
                     try:
                         async with _create_session() as img_session:
-                            async with img_session.get(cover_url, headers=headers, timeout=15) as img_resp:
+                            async with img_session.get(
+                                cover_url, headers=headers, timeout=10
+                            ) as img_resp:
                                 if img_resp.status == 200:
-                                    with open(local_cover, "wb") as f:
-                                        f.write(await img_resp.read())
-                                    cover_path = local_cover
+                                    img_data = await img_resp.read()
+                                    b64 = base64.b64encode(img_data).decode("ascii")
+                                    elements.append(Image(f"data:image/jpeg;base64,{b64}"))
                     except Exception as e:
-                        _log.warning(f"下载封面图失败: {e}")
+                        _log.warning(f"下载B站封面图失败: {e}")
+                elements.append(Text(info_text))
 
-                # 构造富文本消息（封面图 + 文字），使用 NapCat send_msg API
-                message = []
-                if cover_path:
-                    message.append({"type": "image", "data": {"file": cover_path}})
-                message.append({"type": "text", "data": {"text": info_text}})
+                messagechain = MessageChain(*elements)
 
                 if is_group:
-                    await bot.api._http.post("send_group_msg", {
-                        "group_id": msg.group_id,
-                        "message": message,
-                    })
+                    await bot.api.post_group_msg(
+                        group_id=msg.group_id, rtf=messagechain
+                    )
                 else:
-                    await bot.api._http.post("send_private_msg", {
-                        "user_id": msg.user_id,
-                        "message": message,
-                    })
+                    await bot.api.post_private_msg(
+                        user_id=msg.user_id, rtf=messagechain
+                    )
 
-                # 尝试下载视频文件
+                # 尝试发送视频
                 await _try_send_video(msg, is_group, video_info)
 
     except Exception as e:
@@ -415,7 +410,7 @@ async def _process_video(msg, is_group, video_id: str):
 
 
 async def _try_send_video(msg, is_group, video_info: dict):
-    """尝试下载B站视频并发送到群"""
+    """下载B站视频并以视频消息发送到群/私聊"""
     try:
         cid = video_info.get("cid")
         bvid = video_info.get("bvid")
@@ -442,12 +437,25 @@ async def _try_send_video(msg, is_group, video_info: dict):
         async with _create_session(cookies=_cookies) as session:
             async with session.get(playurl_api, headers=headers, timeout=15) as resp:
                 play_data = await resp.json()
-                durl = play_data.get("data", {}).get("durl", [])
-                if not durl:
-                    return
-                video_url = durl[0].get("url")
-                if not video_url:
-                    return
+                data = play_data.get("data", {})
+                durl = data.get("durl", [])
+                dash = data.get("dash")
+
+        video_url = None
+        if durl:
+            video_url = durl[0].get("url")
+        elif dash:
+            # 部分新版视频只有 DASH（无 durl）——取最高画质 video 流
+            videos = dash.get("video", [])
+            if videos:
+                video_url = videos[0].get("baseUrl") or videos[0].get("base_url")
+                _log.info(
+                    f"[Bili] 视频 {bvid} 无 durl，降级使用 DASH video 流 "
+                    f"(id={videos[0].get('id')}, codecs={videos[0].get('codecs')})"
+                )
+        if not video_url:
+            _log.warning(f"[Bili] 视频 {bvid} 无可用播放 URL（无 durl 也无 dash.video）")
+            return
 
         if not os.path.exists(_TMP_DIR):
             os.makedirs(_TMP_DIR, exist_ok=True)
@@ -455,7 +463,7 @@ async def _try_send_video(msg, is_group, video_info: dict):
             os.path.join(_TMP_DIR, f"bili_{bvid or aid}_{cid}.mp4")
         )
 
-        # 下载视频
+        # 下载视频（带 Referer 防 B 站 CDN 403）
         async with _create_session() as session:
             async with session.get(video_url, headers=headers, timeout=300) as resp:
                 with open(video_path, "wb") as f:
@@ -465,20 +473,28 @@ async def _try_send_video(msg, is_group, video_info: dict):
                             break
                         f.write(chunk)
 
-        # 发送视频
+        # 以视频消息发送（sandbox bridge 自动 hard link 进 QQ 沙盒）
         if is_group and hasattr(msg, "group_id"):
             await bot.api.post_group_file(
-                group_id=msg.group_id, file=video_path
+                group_id=msg.group_id, video=video_path
             )
         elif not is_group:
-            await bot.api.upload_private_file(
-                user_id=msg.user_id, file=video_path, name=os.path.basename(video_path)
+            await bot.api.post_private_file(
+                user_id=msg.user_id, video=video_path
             )
         else:
             await msg.reply(text="视频下载完成，但暂不支持发送~")
 
     except Exception as e:
-        _log.warning(f"下载/发送B站视频失败: {e}")
+        _log.warning(f"下载/发送B站视频失败: {e}", exc_info=True)
+        try:
+            err_text = f"视频下载/发送失败喵~: {e}"
+            if is_group and hasattr(msg, "group_id"):
+                await msg.reply(text=err_text)
+            else:
+                await bot.api.post_private_msg(msg.user_id, text=err_text)
+        except Exception:
+            pass  # 反馈失败别再炸一次
 
 
 # ---------------------------------------------------------------------------

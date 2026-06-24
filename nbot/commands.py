@@ -114,6 +114,97 @@ if not hasattr(BotAPI, '_nbot_patched'):
     BotAPI._nbot_patched = True
 # ----------------------
 
+# ----------------------
+# region QQ App Sandbox 自动桥接
+# ----------------------
+# macOS 把 QQ Helper 限制在 ~/Library/Containers/com.tencent.qq/ 容器内，
+# 任何容器外的 fs.open() 都会被 sandbox 拦截（EPERM）。我们用 hard link
+# 把文件桥接到沙盒里——hard link 共享 inode，从沙盒路径访问不被拦截。
+# 这一层在 BotAPI 类级别一次性包装 4 个上传方法，60+ 个调用点不用改。
+from functools import wraps
+
+QQ_SANDBOX_DIR = os.path.expanduser(
+    "~/Library/Containers/com.tencent.qq/Data/Library/Application Support/QQ/nekobot_files"
+)
+
+_BRIDGABLE_KWARGS = ("file", "image", "video", "record", "markdown")
+_UPLOAD_METHODS_WITH_FILE_AS_POSITIONAL = ("upload_group_file", "upload_private_file")
+
+
+def _should_bridge(path) -> bool:
+    """判断 path 是否需要桥接到沙盒（http/base64/data URL 不需要）"""
+    if not isinstance(path, str):
+        return False
+    return not path.startswith(("http://", "https://", "base64://", "data:"))
+
+
+def _bridge_to_qq_sandbox(local_path: str) -> str:
+    """
+    把本地文件 hard link 到 QQ 沙盒，返回沙盒内路径。
+
+    :param local_path: 任意可读文件绝对路径
+    :return: 沙盒内 hard link 的绝对路径；如果 hard link 失败回退原路径
+    """
+    os.makedirs(QQ_SANDBOX_DIR, exist_ok=True)
+    sandbox_path = os.path.join(QQ_SANDBOX_DIR, os.path.basename(local_path))
+    # 旧 hard link 还在就先删掉（源文件可能重新下载被覆盖）
+    if os.path.exists(sandbox_path):
+        try:
+            os.remove(sandbox_path)
+        except OSError:
+            pass
+    try:
+        os.link(local_path, sandbox_path)
+        return sandbox_path
+    except OSError as e:
+        _log.warning(f"[qq-sandbox] hard link 失败 ({local_path}): {e}，回退用原路径")
+        return local_path
+
+
+def _wrap_botapi_upload(orig_method):
+    """
+    包装 BotAPI 上传方法，自动把本地文件参数 hard link 到 QQ 沙盒。
+
+    对 post_*_file（走 /send_group_msg，file 是 keyword arg）:
+        bridge file/image/video/record/markdown 里的本地文件
+    对 upload_*_file（走 /upload_*_file 直传，file 是第 2 个位置参数）:
+        bridge args[1] 或 kwargs['file']
+    """
+    method_name = orig_method.__name__
+    is_upload_with_positional_file = method_name in _UPLOAD_METHODS_WITH_FILE_AS_POSITIONAL
+
+    @wraps(orig_method)
+    async def wrapper(self, *args, **kwargs):
+        if is_upload_with_positional_file:
+            # upload_group_file(self, group_id, file, name, folder_id)
+            # upload_private_file(self, user_id, file, name)
+            if len(args) >= 2 and _should_bridge(args[1]):
+                args = args[:1] + (_bridge_to_qq_sandbox(args[1]),) + args[2:]
+            elif "file" in kwargs and _should_bridge(kwargs["file"]):
+                kwargs["file"] = _bridge_to_qq_sandbox(kwargs["file"])
+        else:
+            # post_*_file(self, group_id/user_id, image=, record=, video=, file=, markdown=)
+            for key in _BRIDGABLE_KWARGS:
+                if key in kwargs and _should_bridge(kwargs[key]):
+                    kwargs[key] = _bridge_to_qq_sandbox(kwargs[key])
+        return await orig_method(self, *args, **kwargs)
+
+    wrapper.__wrapped__ = orig_method  # 留给测试用
+    return wrapper
+
+
+# 模块加载时一次性应用，避免重复包装
+if not getattr(BotAPI, "_nbot_sandbox_wrapped", False):
+    for _m in (
+        "post_group_file",
+        "post_private_file",
+        "upload_group_file",
+        "upload_private_file",
+    ):
+        setattr(BotAPI, _m, _wrap_botapi_upload(getattr(BotAPI, _m)))
+    BotAPI._nbot_sandbox_wrapped = True
+# ----------------------
+
 command_handlers = {}
 
 user_favorites: Dict[str, List[str]] = {}  # 用户收藏夹 {user_id: [comic_ids]}
