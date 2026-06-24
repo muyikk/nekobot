@@ -96,7 +96,7 @@ async def on_douyin_message(msg, is_group: bool) -> bool:
 
             # 从 URL 匹配 douyin 短链
             if url:
-                short_match = re.search(r"(v\.douyin\.com/[a-zA-Z0-9]+)", url)
+                short_match = re.search(r"(v\.douyin\.com/[a-zA-Z0-9_]+)", url)
                 video_match = re.search(r"douyin\.com/video/(\d+)", url)
                 share_match = re.search(r"douyin\.com/share/video/(\d+)", url)
                 if short_match:
@@ -111,7 +111,7 @@ async def on_douyin_message(msg, is_group: bool) -> bool:
 
             # 兜底：在整个 JSON 字符串中搜索
             full_text = json_str
-            short_match = re.search(r"(v\.douyin\.com/[a-zA-Z0-9]+)", full_text)
+            short_match = re.search(r"(v\.douyin\.com/[a-zA-Z0-9_]+)", full_text)
             video_match = re.search(r"douyin\.com/video/(\d+)", full_text)
             if short_match:
                 await _process_douyin(msg, is_group, short_match.group(1))
@@ -124,7 +124,7 @@ async def on_douyin_message(msg, is_group: bool) -> bool:
 
     # 检查文本中的抖音链接
     text_no_cq = re.sub(r"\[CQ:[^\]]+\]", "", raw_msg)
-    short_match = re.search(r"(v\.douyin\.com/[a-zA-Z0-9]+)", text_no_cq)
+    short_match = re.search(r"(v\.douyin\.com/[a-zA-Z0-9_]+)", text_no_cq)
     video_match = re.search(r"douyin\.com/video/(\d+)", text_no_cq)
     share_match = re.search(r"douyin\.com/share/video/(\d+)", text_no_cq)
 

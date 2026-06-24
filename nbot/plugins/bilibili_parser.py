@@ -250,7 +250,7 @@ async def on_bilibili_message(msg, is_group: bool) -> bool:
 
             # 从提取到的 URL 匹配 b23.tv 短链
             if url:
-                b23_match = re.search(r"(b23\.tv/[a-zA-Z0-9]+)", url)
+                b23_match = re.search(r"(b23\.tv/[a-zA-Z0-9_-]+)", url)
                 bv_match = re.search(r"BV([a-zA-Z0-9]{10})", url)
                 av_match = re.search(r"av(\d+)", url, re.IGNORECASE)
                 if b23_match:
@@ -267,7 +267,7 @@ async def on_bilibili_message(msg, is_group: bool) -> bool:
 
             # 3) 兜底：在整个 JSON 字符串中搜索 b23.tv / BV / AV
             full_text = json_str
-            b23_match = re.search(r"(b23\.tv/[a-zA-Z0-9]+)", full_text)
+            b23_match = re.search(r"(b23\.tv/[a-zA-Z0-9_-]+)", full_text)
             bv_match = re.search(r"BV([a-zA-Z0-9]{10})", full_text)
             av_match = re.search(r"av(\d+)", full_text, re.IGNORECASE)
             if b23_match:
@@ -288,7 +288,7 @@ async def on_bilibili_message(msg, is_group: bool) -> bool:
     text_no_cq = re.sub(r"\[CQ:[^\]]+\]", "", raw_msg)
     bvid_match = re.search(r"BV([a-zA-Z0-9]{10})", text_no_cq)
     aid_match = re.search(r"av(\d+)", text_no_cq, re.IGNORECASE)
-    short_match = re.search(r"(b23\.tv/[a-zA-Z0-9]+)", text_no_cq)
+    short_match = re.search(r"(b23\.tv/[a-zA-Z0-9_-]+)", text_no_cq)
 
     video_id = None
     if bvid_match:
