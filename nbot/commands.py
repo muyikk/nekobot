@@ -13,6 +13,7 @@ import hashlib
 import html
 import jmcomic
 from nbot.utils.http_client import get_sync, post_sync, head_sync
+from nbot.utils.message_sender import send_text, send_file
 import random
 import configparser
 import json
@@ -112,97 +113,6 @@ if not hasattr(BotAPI, '_nbot_patched'):
     BotAPI.post_group_msg = wrapped_post_group_msg
     GroupMessage.reply = wrapped_group_reply
     BotAPI._nbot_patched = True
-# ----------------------
-
-# ----------------------
-# region QQ App Sandbox 自动桥接
-# ----------------------
-# macOS 把 QQ Helper 限制在 ~/Library/Containers/com.tencent.qq/ 容器内，
-# 任何容器外的 fs.open() 都会被 sandbox 拦截（EPERM）。我们用 hard link
-# 把文件桥接到沙盒里——hard link 共享 inode，从沙盒路径访问不被拦截。
-# 这一层在 BotAPI 类级别一次性包装 4 个上传方法，60+ 个调用点不用改。
-from functools import wraps
-
-QQ_SANDBOX_DIR = os.path.expanduser(
-    "~/Library/Containers/com.tencent.qq/Data/Library/Application Support/QQ/nekobot_files"
-)
-
-_BRIDGABLE_KWARGS = ("file", "image", "video", "record", "markdown")
-_UPLOAD_METHODS_WITH_FILE_AS_POSITIONAL = ("upload_group_file", "upload_private_file")
-
-
-def _should_bridge(path) -> bool:
-    """判断 path 是否需要桥接到沙盒（http/base64/data URL 不需要）"""
-    if not isinstance(path, str):
-        return False
-    return not path.startswith(("http://", "https://", "base64://", "data:"))
-
-
-def _bridge_to_qq_sandbox(local_path: str) -> str:
-    """
-    把本地文件 hard link 到 QQ 沙盒，返回沙盒内路径。
-
-    :param local_path: 任意可读文件绝对路径
-    :return: 沙盒内 hard link 的绝对路径；如果 hard link 失败回退原路径
-    """
-    os.makedirs(QQ_SANDBOX_DIR, exist_ok=True)
-    sandbox_path = os.path.join(QQ_SANDBOX_DIR, os.path.basename(local_path))
-    # 旧 hard link 还在就先删掉（源文件可能重新下载被覆盖）
-    if os.path.exists(sandbox_path):
-        try:
-            os.remove(sandbox_path)
-        except OSError:
-            pass
-    try:
-        os.link(local_path, sandbox_path)
-        return sandbox_path
-    except OSError as e:
-        _log.warning(f"[qq-sandbox] hard link 失败 ({local_path}): {e}，回退用原路径")
-        return local_path
-
-
-def _wrap_botapi_upload(orig_method):
-    """
-    包装 BotAPI 上传方法，自动把本地文件参数 hard link 到 QQ 沙盒。
-
-    对 post_*_file（走 /send_group_msg，file 是 keyword arg）:
-        bridge file/image/video/record/markdown 里的本地文件
-    对 upload_*_file（走 /upload_*_file 直传，file 是第 2 个位置参数）:
-        bridge args[1] 或 kwargs['file']
-    """
-    method_name = orig_method.__name__
-    is_upload_with_positional_file = method_name in _UPLOAD_METHODS_WITH_FILE_AS_POSITIONAL
-
-    @wraps(orig_method)
-    async def wrapper(self, *args, **kwargs):
-        if is_upload_with_positional_file:
-            # upload_group_file(self, group_id, file, name, folder_id)
-            # upload_private_file(self, user_id, file, name)
-            if len(args) >= 2 and _should_bridge(args[1]):
-                args = args[:1] + (_bridge_to_qq_sandbox(args[1]),) + args[2:]
-            elif "file" in kwargs and _should_bridge(kwargs["file"]):
-                kwargs["file"] = _bridge_to_qq_sandbox(kwargs["file"])
-        else:
-            # post_*_file(self, group_id/user_id, image=, record=, video=, file=, markdown=)
-            for key in _BRIDGABLE_KWARGS:
-                if key in kwargs and _should_bridge(kwargs[key]):
-                    kwargs[key] = _bridge_to_qq_sandbox(kwargs[key])
-        return await orig_method(self, *args, **kwargs)
-
-    wrapper.__wrapped__ = orig_method  # 留给测试用
-    return wrapper
-
-
-# 模块加载时一次性应用，避免重复包装
-if not getattr(BotAPI, "_nbot_sandbox_wrapped", False):
-    for _m in (
-        "post_group_file",
-        "post_private_file",
-        "upload_group_file",
-        "upload_private_file",
-    ):
-        setattr(BotAPI, _m, _wrap_botapi_upload(getattr(BotAPI, _m)))
-    BotAPI._nbot_sandbox_wrapped = True
 # ----------------------
 
 command_handlers = {}
@@ -928,18 +838,12 @@ switch.save_switches()
 @register_command("/tts",help_text = "/tts -> 开启或关闭TTS(admin)",admin_show = True,category = "4")
 async def handle_tts(msg, is_group=True):
     if str(msg.user_id) not in admin:
-        if is_group:
-            await msg.reply(text="你没有权限使用此命令喵~")
-        else:
-            await bot.api.post_private_msg(msg.user_id, text="你没有权限使用此命令喵~")
+        await send_text(msg, "你没有权限使用此命令喵~", is_group=is_group)
         return
     if_tts = switch.toggle_switch('tts', group_id=str(msg.group_id) if is_group else None, user_id=str(msg.user_id) if not is_group else None)
 
     text = "已开启TTS喵~" if if_tts else "已关闭TTS喵~"
-    if is_group:
-        await msg.reply(text=text)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=text)
+    await send_text(msg, text, is_group=is_group)
     switch.save_switches()
 
 # ---------------漫画类命令----------------
@@ -947,10 +851,7 @@ comic_cache = []
 JM_RANK_DECODE_LIMIT = 50
 @register_command("/jmrank",help_text = "/jmrank <月排行/周排行> -> 获取排行榜",category = "1")
 async def handle_jmrank(msg, is_group=True):
-    if is_group:
-        await msg.reply(text="正在获取排行喵~")
-    else:
-        await bot.api.post_private_msg(msg.user_id, text="正在获取排行喵~")
+    await send_text(msg, "正在获取排行喵~", is_group=is_group)
     select = msg.raw_message[len("/jmrank"):].strip()
     op = JmOption.default()
     cl = op.new_jm_client()
@@ -987,22 +888,13 @@ async def handle_jmrank(msg, is_group=True):
     close_jm_grid_html(filepath)
 
     if not os.path.exists(filepath):
-        if is_group:
-            await msg.reply(text="获取排行失败喵~，文件不存在")
-        else:
-            await bot.api.post_private_msg(msg.user_id, text="获取排行失败喵~，文件不存在")
+        await send_text(msg, "获取排行失败喵~，文件不存在", is_group=is_group)
         return
-    if is_group:
-        await bot.api.post_group_file(msg.group_id, file=filepath)
-    else:
-        await bot.api.upload_private_file(msg.user_id, filepath, filename)
+    await send_file(msg, filepath, is_group=is_group, filename=filename)
 
 @register_command("/jm_search",help_text = "/jm_search <内容> -> 搜索漫画",category = "1")
 async def handle_search(msg, is_group=True):
-    if is_group:
-        await msg.reply(text="正在搜索喵~")
-    else:
-        await bot.api.post_private_msg(msg.user_id, text="正在搜索喵~")
+    await send_text(msg, "正在搜索喵~", is_group=is_group)
 
     cache_dir = os.path.join(load_address(),"search")
     os.makedirs(cache_dir,exist_ok = True)
@@ -1010,10 +902,7 @@ async def handle_search(msg, is_group=True):
     content = msg.raw_message[len("/jm_search"):].strip()
 
     if not content or content == " ":
-        if is_group:
-            await msg.reply(text="搜索内容不能为空喵~")
-        else:
-            await bot.api.post_private_msg(msg.user_id, text="搜索内容不能为空喵~")
+        await send_text(msg, "搜索内容不能为空喵~", is_group=is_group)
         return
 
     file_token = hashlib.md5(f"{content}_{time.time()}".encode("utf-8")).hexdigest()[:8]
@@ -1064,10 +953,7 @@ async def handle_search(msg, is_group=True):
 </html>"""
         with open(filepath, "w", encoding="utf-8") as f:
             f.write(html_head)
-        if is_group:
-            await bot.api.post_group_file(msg.group_id, file=filepath)
-        else:
-            await bot.api.upload_private_file(msg.user_id, filepath, filename)
+        await send_file(msg, filepath, is_group=is_group, filename=filename)
         return
 
     # 多本搜索，生成卡片网格HTML
@@ -1088,23 +974,14 @@ async def handle_search(msg, is_group=True):
     close_jm_grid_html(filepath)
 
     if not os.path.exists(filepath):
-        if is_group:
-            await msg.reply(text="搜索失败喵~，文件不存在")
-        else:
-            await bot.api.post_private_msg(msg.user_id, text="搜索失败喵~，文件不存在")
+        await send_text(msg, "搜索失败喵~，文件不存在", is_group=is_group)
         return
 
-    if is_group:
-        await bot.api.post_group_file(msg.group_id, file=filepath)
-    else:
-        await bot.api.upload_private_file(msg.user_id, filepath, filename)
+    await send_file(msg, filepath, is_group=is_group, filename=filename)
 
 @register_command("/jm_tag",help_text = "/jm_tag <标签> -> 搜索漫画标签",category = "1")
 async def handle_tag(msg, is_group=True):
-    if is_group:
-        await msg.reply(text="正在搜索喵~")
-    else:
-        await bot.api.post_private_msg(msg.user_id, text="正在搜索喵~")
+    await send_text(msg, "正在搜索喵~", is_group=is_group)
 
     cache_dir = os.path.join(load_address(),"search")
     os.makedirs(cache_dir,exist_ok = True)
@@ -1132,29 +1009,20 @@ async def handle_tag(msg, is_group=True):
 
     close_jm_grid_html(filepath)
 
-    if is_group:
-        await bot.api.post_group_file(msg.group_id, file=filepath)
-    else:
-        await bot.api.upload_private_file(msg.user_id, filepath, filename)
+    await send_file(msg, filepath, is_group=is_group, filename=filename)
 
 @register_command("/get_fav",help_text = "/get_fav <用户名> <密码> -> 获取收藏夹(群聊请私聊)",category = "1")
 async def handle_get_fav(msg, is_group=True):
     match = re.match(r'^/get_fav\s+(\S+)\s+(\S+)$', msg.raw_message)
     if not match:
         error_msg = "格式错误喵~ 请输入 /get_fav 用户名 密码"
-        if is_group:
-            await msg.reply(text=error_msg)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=error_msg)
+        await send_text(msg, error_msg, is_group=is_group)
         return
 
     username = match.group(1)
     password = match.group(2)
 
-    if is_group:
-        await msg.reply(text="正在获取收藏夹喵~")
-    else:
-        await bot.api.post_private_msg(msg.user_id, text="正在获取收藏夹喵~")
+    await send_text(msg, "正在获取收藏夹喵~", is_group=is_group)
 
     cache_dir = os.path.join(load_address(),"fav")
     os.makedirs(cache_dir, exist_ok=True)
@@ -1169,10 +1037,7 @@ async def handle_get_fav(msg, is_group=True):
     try:
         cl.login(username, password)  # 也可以使用login插件/配置cookies
     except Exception as e:
-        if is_group:
-            await msg.reply(text=f"登录失败喵~：{e}")
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=f"登录失败喵~：{e}")
+        await send_text(msg, f"登录失败喵~：{e}", is_group=is_group)
         return
 
     build_jm_grid_html(f"{html.escape(username)} · JM 收藏夹", filepath)
@@ -1189,10 +1054,7 @@ async def handle_get_fav(msg, is_group=True):
 
     close_jm_grid_html(filepath)
 
-    if is_group:
-        await bot.api.post_group_file(msg.group_id, file=filepath)
-    else:
-        await bot.api.upload_private_file(msg.user_id, filepath, filename)
+    await send_file(msg, filepath, is_group=is_group, filename=filename)
 
 @register_command("/jm",help_text = "/jm <漫画ID> -> 下载漫画",category = "1")
 async def handle_jmcomic(msg, is_group=True):
@@ -1202,10 +1064,7 @@ async def handle_jmcomic(msg, is_group=True):
         # 检查是否在全局、群组或用户黑名单中
         if comic_id in black_list_comic["global"]:
             error_msg = "该漫画已被加入黑名单喵~"
-            if is_group:
-                await msg.reply(text=error_msg)
-            else:
-                await bot.api.post_private_msg(msg.user_id, text=error_msg)
+            await send_text(msg, error_msg, is_group=is_group)
             return
         if is_group:
             group_id = str(msg.group_id)
@@ -1246,47 +1105,32 @@ async def handle_jmcomic(msg, is_group=True):
                 comic_id = comic_cache[int(comic_id)-1]
             except IndexError:
                 error_msg = "超出范围了喵~"
-                if is_group:
-                    await msg.reply(text=error_msg)
-                else:
-                    await bot.api.post_private_msg(msg.user_id, text=error_msg)
+                await send_text(msg, error_msg, is_group=is_group)
                 return
         
         try:
             client = JmOption.default().new_jm_client()
         except JmcomicException:
             error_msg = "当前禁漫站点接口不可用喵~ 可能是 /setting 接口返回异常，请稍后重试或检查jmcomic配置喵~"
-            if is_group:
-                await msg.reply(text=error_msg)
-            else:
-                await bot.api.post_private_msg(msg.user_id, text=error_msg)
+            await send_text(msg, error_msg, is_group=is_group)
             return
         try:
             album: JmAlbumDetail = client.get_album_detail(comic_id)
         except MissingAlbumPhotoException:
             error_msg = "该漫画ID不存在喵~"
-            if is_group:
-                await msg.reply(text=error_msg)
-            else:
-                await bot.api.post_private_msg(msg.user_id, text=error_msg)
+            await send_text(msg, error_msg, is_group=is_group)
             return
         
         # 立即回复用户，不等待下载完成
         reply_text = f"已开始下载漫画ID：{comic_id}，下载完成后会自动通知喵~"
-        if is_group:
-            await msg.reply(text=reply_text)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply_text)
+        await send_text(msg, reply_text, is_group=is_group)
 
         # 创建后台任务
         try:
             await asyncio.gather(download_and_send_comic(comic_id, msg, is_group))
         except Exception as e:
             error_msg = f"下载漫画失败喵~: {str(e)}"
-            if is_group:
-                await msg.reply(text=error_msg)
-            else:
-                await bot.api.post_private_msg(msg.user_id, text=error_msg)
+            await send_text(msg, error_msg, is_group=is_group)
 
     else:
         error_msg = "格式错误了喵~，请输入 /jm 后跟漫画ID"
@@ -1343,10 +1187,7 @@ async def download_and_send_comic(comic_id, msg, is_group):
                     text = "漫画已下载，但发送到邮箱失败喵~，原因是邮件大小超过邮箱限制喵~"
                 else:
                     text = "漫画已下载，但发送到邮箱失败喵~，请检查邮箱配置或稍后重试喵~"
-            if is_group:
-                await msg.reply(text=text)
-            else:
-                await bot.api.post_private_msg(msg.user_id, text=text)
+            await send_text(msg, text, is_group=is_group)
             return
 
         file_size = os.path.getsize(file_path) / (1024 * 1024)  # 转换为MB
@@ -1370,10 +1211,7 @@ async def download_and_send_comic(comic_id, msg, is_group):
     except Exception as e:
         file_path = normalize_file_path(os.path.join(load_address(), f"pdf/{comic_id}.pdf"))
         error_msg = f"下载失败喵~: {str(e)}"
-        if is_group:
-            await msg.reply(text=error_msg)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=error_msg)
+        await send_text(msg, error_msg, is_group=is_group)
         if os.path.exists(file_path):
             file_size = os.path.getsize(file_path) / (1024 * 1024)  # 转换为MB
             file_text = f"文件大小：{file_size:.2f} MB，正在上传喵~"
@@ -1387,10 +1225,7 @@ async def download_and_send_comic(comic_id, msg, is_group):
 @register_command("/jm_clear",help_text = "/jm_clear -> 清除缓存",category = "1")
 async def handle_jm_clear(msg, is_group=True):
     comic_cache.clear()
-    if is_group:
-        await msg.reply(text="缓存已清除喵~")
-    else:
-        await bot.api.post_private_msg(msg.user_id, text="缓存已清除喵~")
+    await send_text(msg, "缓存已清除喵~", is_group=is_group)
 
 @register_command("/jm_send_user", help_text="/jm_send_user <on|off> -> 开启/关闭群聊用户私信发送漫画(admin)",category = "1",admin_show=True)
 async def handle_jm_send_user(msg, is_group=True):
@@ -1405,10 +1240,7 @@ async def handle_jm_send_user(msg, is_group=True):
         switch.set_switch_state('jm_send_user', state == 'on', group_id=str(msg.group_id) if is_group else None,user_id=str(msg.user_id) if not is_group else None)
 
         reply = f"用户私信发送漫画已 {'开启' if state == 'on' else '关闭'} 喵~"
-    if is_group:
-        await msg.reply(text=reply)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=reply)
+    await send_text(msg, reply, is_group=is_group)
     switch.save_switches()
 
 @register_command("/jm_send", help_text="/jm_send <on|off> -> 开启/关闭发送漫画(admin)",category = "1",admin_show=True)
@@ -1423,10 +1255,7 @@ async def handle_jm_send(msg, is_group=True):
         switch.set_switch_state('jm_send', state == 'on', group_id=str(msg.group_id) if is_group else None,user_id=str(msg.user_id) if not is_group else None)
 
         reply = f"{'群组' if is_group else '用户'}发送漫画已 {'开启' if state == 'on' else '关闭'} 喵~"
-    if is_group:
-        await msg.reply(text=reply)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=reply)
+    await send_text(msg, reply, is_group=is_group)
     switch.save_switches()
 
 @register_command("/jm_pwd", help_text="/jm_pwd <on|off> -> 开启/关闭密码加密(admin)，密码为漫画id",category = "1",admin_show=True)
@@ -1441,10 +1270,7 @@ async def handle_jm_pwd(msg, is_group=True):
     else:
         switch.set_switch_state('pdf_password', state == 'on', group_id=str(msg.group_id) if is_group else None,user_id=str(msg.user_id) if not is_group else None)
         reply = f"{'群组' if is_group else '用户'}密码加密已 {'开启' if state == 'on' else '关闭'} 喵~，密码为漫画id"
-    if is_group:
-        await msg.reply(text=reply)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=reply)
+    await send_text(msg, reply, is_group=is_group)
 
 @register_command("/jm_email", help_text="/jm_email <邮箱> <on|off> -> 配置邮箱并开启或关闭发送漫画到邮箱",category = "1")
 async def handle_jm_email(msg, is_group=True):
@@ -1457,10 +1283,7 @@ async def handle_jm_email(msg, is_group=True):
         current_email = user_email.get(user_id)
         enabled = switch.get_switch_state('jm_send_email', user_id=user_id)
         text = f"当前邮箱：{current_email or '未设置'}，状态：{'开启' if enabled else '关闭'}"
-        if is_group:
-            await msg.reply(text=text)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=text)
+        await send_text(msg, text, is_group=is_group)
         return
     if len(parts) == 1:
         if parts[0].lower() in ("on", "off"):
@@ -1474,18 +1297,12 @@ async def handle_jm_email(msg, is_group=True):
             state = parts[1].lower() == "on"
         else:
             text = "第二个参数请输入 on 或 off 喵~"
-            if is_group:
-                await msg.reply(text=text)
-            else:
-                await bot.api.post_private_msg(msg.user_id, text=text)
+            await send_text(msg, text, is_group=is_group)
             return
     if email:
         if "@" not in email:
             text = "请输入正确的邮箱地址喵~"
-            if is_group:
-                await msg.reply(text=text)
-            else:
-                await bot.api.post_private_msg(msg.user_id, text=text)
+            await send_text(msg, text, is_group=is_group)
             return
         user_email[user_id] = email
         save_email_config()
@@ -1495,10 +1312,7 @@ async def handle_jm_email(msg, is_group=True):
     text = "邮箱配置已更新喵~"
     if state is not None:
         text = f"邮箱配置已更新喵~，发送到邮箱已{'开启' if state else '关闭'}"
-    if is_group:
-        await msg.reply(text=text)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=text)
+    await send_text(msg, text, is_group=is_group)
 
 # ====下面的收藏夹不是官方的收藏夹，是本地储存的====
 @register_command("/add_fav", help_text="/add_fav <漫画ID> -> 添加收藏",category = "1")
@@ -1529,10 +1343,7 @@ async def handle_add_favorite(msg, is_group=True):
                 reply = f"漫画 {comic_id} 已在个人收藏中喵~"
         save_favorites()
     
-    if is_group:
-        await msg.reply(text=reply)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=reply)
+    await send_text(msg, reply, is_group=is_group)
 
 @register_command("/list_fav", help_text="/list_fav -> 查看收藏列表",category = "1")
 async def handle_list_favorites(msg, is_group=True):
@@ -1551,10 +1362,7 @@ async def handle_list_favorites(msg, is_group=True):
     else:
         reply = "收藏夹是空的喵~"
     
-    if is_group:
-        await msg.reply(text=reply)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=reply)
+    await send_text(msg, reply, is_group=is_group)
 
 @register_command("/del_fav", help_text="/del_fav <漫画ID> -> 删除收藏",category = "1")
 async def handle_del_favorite(msg, is_group=True):
@@ -1581,10 +1389,7 @@ async def handle_del_favorite(msg, is_group=True):
             reply = "个人收藏夹是空的喵~"
     
     save_favorites()
-    if is_group:
-        await msg.reply(text=reply)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=reply)
+    await send_text(msg, reply, is_group=is_group)
 
 @register_command("/add_black_list","/abl",help_text = "/add_black_list 或 /abl  <漫画ID> -> 添加黑名单",category = "1")
 async def handle_add_black_list(msg, is_group=True):
@@ -1617,20 +1422,14 @@ async def handle_add_black_list(msg, is_group=True):
                 black_list_comic["users"][user_id].append(comic_id)
                 write_blak_list()
                 reply = f"已在你的黑名单中添加漫画 {comic_id} 喵~"
-    if is_group:
-        await msg.reply(text=reply)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=reply)
+    await send_text(msg, reply, is_group=is_group)
 
 @register_command("/add_global_black_list","/agbl",help_text = "/add_global_black_list 或 /agbl <漫画ID> -> 添加全局黑名单(admin)",category = "1",admin_show=True)
 async def handle_add_global_black_list(msg, is_group=True):
 
     if str(msg.user_id) not in admin:
         reply = "你没有权限喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
         return
 
     comic_id = ""
@@ -1648,20 +1447,14 @@ async def handle_add_global_black_list(msg, is_group=True):
             black_list_comic["global"].append(comic_id)
             write_blak_list()
             reply = f"已在全局黑名单中添加漫画 {comic_id} 喵~"
-    if is_group:
-        await msg.reply(text=reply)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=reply)
+    await send_text(msg, reply, is_group=is_group)
 
 @register_command("/del_global_black_list","/dgbl",help_text = "/del_global_black_list 或 /dgbl <漫画ID> -> 删除全局黑名单(admin)",category = "1",admin_show=True)
 async def handle_del_global_black_list(msg, is_group=True):
 
     if str(msg.user_id) not in admin:
         reply = "你没有权限喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
         return
     
     comic_id = ""
@@ -1679,10 +1472,7 @@ async def handle_del_global_black_list(msg, is_group=True):
             reply = f"已从全局黑名单中删除漫画 {comic_id} 喵~"
         else:
             reply = f"漫画 {comic_id} 不在全局黑名单中喵~"
-    if is_group:
-        await msg.reply(text=reply)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=reply)
+    await send_text(msg, reply, is_group=is_group)
 
 @register_command("/del_black_list","/dbl",help_text = "/del_black_list 或 /dbl <漫画ID> -> 删除黑名单",category = "1")
 async def handle_del_black_list(msg, is_group=True):
@@ -1711,10 +1501,7 @@ async def handle_del_black_list(msg, is_group=True):
                 reply = f"已从你的黑名单中删除漫画 {comic_id} 喵~"
             else:
                 reply = f"漫画 {comic_id} 不在你的黑名单中喵~"
-    if is_group:
-        await msg.reply(text=reply)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=reply)
+    await send_text(msg, reply, is_group=is_group)
 
 @register_command("/list_black_list","/lbl",help_text = "/list_black_list 或 /lbl -> 查看黑名单",category = "1")
 async def handle_list_black_list(msg, is_group=True):
@@ -1730,10 +1517,7 @@ async def handle_list_black_list(msg, is_group=True):
             reply = "你的黑名单中的漫画ID:\n全局：" + "\n".join(black_list_comic["global"]) + "\n个人：" + "\n".join(black_list_comic["users"].get(user_id, []))
         else:
             reply = "你的黑名单是空的喵~"
-    if is_group:
-        await msg.reply(text=reply)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=reply)
+    await send_text(msg, reply, is_group=is_group)
         
 #------------------------
 
@@ -1741,10 +1525,7 @@ async def handle_list_black_list(msg, is_group=True):
 async def handle_agree(msg, is_group=True):
     if str(msg.user_id) not in admin:
         reply = "你没有权限喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
         return
 
     if not is_group:
@@ -1757,32 +1538,20 @@ async def handle_agree(msg, is_group=True):
 @register_command("/restart",help_text="/restart -> 重启机器人(admin)",category = "4",admin_show=True)
 async def handle_restart(msg, is_group=True):
     if str(msg.user_id) not in admin:
-        if is_group:
-            await msg.reply(text="只有管理员才能重启机器人喵~")
-        else:
-            await bot.api.post_private_msg(msg.user_id, text="只有管理员才能重启机器人喵~")
+        await send_text(msg, "只有管理员才能重启机器人喵~", is_group=is_group)
         return
     reply_text = "正在重启喵~"
-    if is_group:
-        await msg.reply(text=reply_text)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=reply_text)
+    await send_text(msg, reply_text, is_group=is_group)
     # 重启逻辑
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 @register_command("/shutdown",help_text="/shutdown -> 关闭机器人(admin)",category = "4",admin_show=True)
 async def handle_shutdown(msg, is_group=True):
     if str(msg.user_id) not in admin:
-        if is_group:
-            await msg.reply(text="只有管理员才能关闭机器人喵~")
-        else:
-            await bot.api.post_private_msg(msg.user_id, text="只有管理员才能关闭机器人喵~")
+        await send_text(msg, "只有管理员才能关闭机器人喵~", is_group=is_group)
         return
     reply_text = "主人，下次再见喵~"
-    if is_group:
-        await msg.reply(text=reply_text)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=reply_text)
+    await send_text(msg, reply_text, is_group=is_group)
     import sys
     sys.exit()
 
@@ -1904,10 +1673,7 @@ async def handle_generic_file(msg, is_group: bool, section: str, file_type: str,
 
     except Exception as e:
         error_msg = f"配置错误喵~: {str(e)}" if '配置' in str(e) else f"获取失败喵~: {str(e)}"
-        if is_group:
-            await msg.reply(text=error_msg)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=error_msg)
+        await send_text(msg, error_msg, is_group=is_group)
 
 # 统一调用
 @register_command("/random_image","/ri",help_text = "/random_image 或者 /ri -> 随机图片",category = "3")
@@ -2001,28 +1767,19 @@ async def handle_random_video(msg, is_group=True):
 async def handle_d(msg, is_group=True):
     link = msg.raw_message[len("/dv"):].strip()
     if not link:
-        if is_group:
-            await msg.reply(text="请输入链接喵~")
-        else:
-            await bot.api.post_private_msg(msg.user_id, text="请输入链接喵~")
+        await send_text(msg, "请输入链接喵~", is_group=is_group)
         return
 
     if re.match(r'^https?://', link):  # 检查是否为合法链接
         await handle_generic_file(msg, is_group, '', 'video', custom_url=link)  
     else:
-        if is_group:
-            await msg.reply(text="请输入合法的链接喵~")
-        else:
-            await bot.api.post_private_msg(msg.user_id, text="请输入合法的链接喵~")
+        await send_text(msg, "请输入合法的链接喵~", is_group=is_group)
 
 @register_command("/di",help_text="/di <link> -> 下载图片",category = "3")
 async def handle_di(msg, is_group=True):
     link = msg.raw_message[len("/di"):].strip()
     if not link:
-        if is_group:
-            await msg.reply(text="请输入链接喵~")
-        else:
-            await bot.api.post_private_msg(msg.user_id, text="请输入链接喵~")
+        await send_text(msg, "请输入链接喵~", is_group=is_group)
         return
 
     if re.match(r'^https?://', link):  # 检查是否为合法链接
@@ -2032,28 +1789,19 @@ async def handle_di(msg, is_group=True):
         else:
             await bot.api.upload_private_file(user_id=msg.user_id,file=link,name="download.jpg")
     else:
-        if is_group:
-            await msg.reply(text="请输入合法的链接喵~")
-        else:
-            await bot.api.post_private_msg(msg.user_id, text="请输入合法的链接喵~")
+        await send_text(msg, "请输入合法的链接喵~", is_group=is_group)
 
 @register_command("/df",help_text="/df <link> -> 下载文件",category = "3")
 async def handle_df(msg, is_group=True):
     link = msg.raw_message[len("/df"):].strip()
     if not link:
-        if is_group:
-            await msg.reply(text="请输入链接喵~")
-        else:
-            await bot.api.post_private_msg(msg.user_id, text="请输入链接喵~")
+        await send_text(msg, "请输入链接喵~", is_group=is_group)
         return
 
     if re.match(r'^https?://', link):  # 检查是否为合法链接
         await handle_generic_file(msg, is_group, '', 'file', custom_url=link)
     else:
-        if is_group:
-            await msg.reply(text="请输入合法的链接喵~")
-        else:
-            await bot.api.post_private_msg(msg.user_id, text="请输入合法的链接喵~")
+        await send_text(msg, "请输入合法的链接喵~", is_group=is_group)
 
 #---------------------------------------------
 
@@ -2184,10 +1932,7 @@ async def handle_precise_remind(msg, is_group=True):
         
         target_time = datetime.strptime(f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
         if target_time < now:
-            if is_group:
-                await msg.reply(text="时间已经过去喵~")
-            else:
-                await bot.api.post_private_msg(msg.user_id, text="时间已经过去喵~")
+            await send_text(msg, "时间已经过去喵~", is_group=is_group)
             return
 
         reply = f"已设置精确提醒喵~将在 {target_time} 提醒: {content}"
@@ -2200,10 +1945,7 @@ async def handle_precise_remind(msg, is_group=True):
             
     except ValueError:
         error_msg = "格式错误喵~ 使用: /precise_remind MM-DD HH:MM 提醒内容"
-        if is_group:
-            await msg.reply(text=error_msg)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=error_msg)
+        await send_text(msg, error_msg, is_group=is_group)
 
 @register_command("/smtp", help_text="/smtp <host> <port> <user> <password> <tls(1/0)> <from> -> 配置当前用户SMTP服务",category = "4")
 async def handle_smtp_config_command(msg, is_group=True):
@@ -2216,27 +1958,18 @@ async def handle_smtp_config_command(msg, is_group=True):
             text = f"当前SMTP已配置喵~ host={conf.get('host')}, port={conf.get('port')}"
         else:
             text = "当前还没有配置SMTP喵~"
-        if is_group:
-            await msg.reply(text=text)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=text)
+        await send_text(msg, text, is_group=is_group)
         return
     if len(parts) < 5:
         text = "格式错误喵~ 应为: /smtp host port user password tls(1/0) [from]"
-        if is_group:
-            await msg.reply(text=text)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=text)
+        await send_text(msg, text, is_group=is_group)
         return
     host = parts[0]
     try:
         port = int(parts[1])
     except ValueError:
         text = "端口必须是数字喵~"
-        if is_group:
-            await msg.reply(text=text)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=text)
+        await send_text(msg, text, is_group=is_group)
         return
     user = parts[2]
     password = parts[3]
@@ -2252,19 +1985,13 @@ async def handle_smtp_config_command(msg, is_group=True):
     }
     save_smtp_config()
     text = "SMTP配置已更新喵~"
-    if is_group:
-        await msg.reply(text=text)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=text)
+    await send_text(msg, text, is_group=is_group)
 
 @register_command("/task",help_text="/task </bot.api.xxxx(参数1=值1...)> <时间(小时)> <是否循环(1/0)> -> 设置定时任务(admin)",category = "7",admin_show=True)
 async def handle_task(msg,is_group=True):
     if str(msg.user_id) not in admin:
         text = "你没有权限设置定时任务喵~"
-        if is_group:
-            await msg.reply(text=text)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=text)
+        await send_text(msg, text, is_group=is_group)
         return
     
     match = re.match(r'^/task\s+(.+)\s+(\d+\.?\d*)\s+(\d)$', msg.raw_message) #正则支持小数
@@ -2303,76 +2030,52 @@ async def handle_task(msg,is_group=True):
     if loop == 0:
         task = asyncio.create_task(schedule_job_task(hours,0,f"{command_str}_{hours}_{loop}",func, **params))
         schedule_tasks[f"{command_str}_{hours}_{loop}"] = task
-        if is_group:
-            await msg.reply(text=f"已设置定时任务喵~{hours}小时后会执行：{command_str}")
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=f"已设置定时任务喵~{hours}小时后会执行：{command_str}")
+        await send_text(msg, f"已设置定时任务喵~{hours}小时后会执行：{command_str}", is_group=is_group)
         return
 
     else:
         task = asyncio.create_task(schedule_job_task(hours,1,f"{command_str}_{hours}_{loop}",func, **params))
         schedule_tasks[f"{command_str}_{hours}_{loop}"] = task
-        if is_group:
-            await msg.reply(text=f"已设置循环定时任务喵~{hours}小时后会执行：{command_str}")
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=f"已设置循环定时任务喵~{hours}小时后会执行：{command_str}")
+        await send_text(msg, f"已设置循环定时任务喵~{hours}小时后会执行：{command_str}", is_group=is_group)
         return
 
 @register_command("/list_tasks","/lt",help_text = "/list_tasks 或者 /lt -> 查看定时任务(admin)",category = "7",admin_show=True)
 async def handle_list_tasks(msg, is_group=True):
     if str(msg.user_id) not in admin:
         text = "你没有权限查看定时任务喵~"
-        if is_group:
-            await msg.reply(text=text)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=text)
+        await send_text(msg, text, is_group=is_group)
         return
     text = "定时任务列表：\n"
     tot = 0
     for i in schedule_tasks.keys():
         tot += 1
         text += f"{tot}. {i}\n"
-    if is_group:
-        await msg.reply(text=text)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=text)
+    await send_text(msg, text, is_group=is_group)
     return
 
 @register_command("/cancel_tasks","/ct",help_text = "/cancel_tasks 或者 /ct <任务名> -> 取消定时任务(admin)",category = "7",admin_show=True)
 async def handle_cancel_tasks(msg, is_group=True):
     if str(msg.user_id) not in admin:
         text = "你没有权限取消定时任务喵~"
-        if is_group:
-            await msg.reply(text=text)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=text)
+        await send_text(msg, text, is_group=is_group)
         return
     pre = "/cancel_tasks" if msg.raw_message.startswith("/cancel_tasks") else "/ct"
     name = msg.raw_message[len(pre):].strip()
 
     if name == "":
         text = "请输入任务名喵~"
-        if is_group:
-            await msg.reply(text=text)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=text)
+        await send_text(msg, text, is_group=is_group)
         return
     
     if name not in schedule_tasks:
         text = "没有这个任务喵~"
-        if is_group:
-            await msg.reply(text=text)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=text)
+        await send_text(msg, text, is_group=is_group)
         return
     
     schedule_tasks[name].cancel()
     del schedule_tasks[name]
     text = "取消成功喵~"
-    if is_group:
-        await msg.reply(text=text)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=text)
+    await send_text(msg, text, is_group=is_group)
     return
 
 @register_command("/set_admin","/sa",help_text = "/set_admin <qq号> 或者 /sa <qq号> -> 设置管理员(root)",category = "4",admin_show=True)
@@ -2420,10 +2123,7 @@ async def handle_del_admin(msg, is_group=True):
 
 @register_command("/get_admin","/ga",help_text = "/get_admin 或者 /ga -> 获取管理员",category = "4")
 async def handle_get_admin(msg, is_group=True):
-    if is_group:
-        await msg.reply(text="管理员列表："+str(admin))
-    else:
-        await bot.api.post_private_msg(msg.user_id, text="管理员列表："+str(admin))
+    await send_text(msg, "管理员列表："+str(admin), is_group=is_group)
 
 
 @register_command("/set_ids",help_text = "/set_ids <昵称> <个性签名> <性别> -> 设置账号信息(管理员)",category = "4",admin_show=True)
@@ -2443,10 +2143,7 @@ async def handle_set(msg, is_group=True):
     msgs = msg.raw_message[len("/set_ids"):].split(" ")
     if len(msgs) < 3:
         text = "格式错误喵~ 请输入 /set 昵称 个性签名 性别"
-        if is_group:
-            await msg.reply(text=text)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=text)
+        await send_text(msg, text, is_group=is_group)
         return
     try:
         nickname = msgs[0]
@@ -2454,16 +2151,10 @@ async def handle_set(msg, is_group=True):
         sex = msgs[2]
         await bot.api.set_qq_profile(nickname=nickname, personal_note=personal_note, sex=sex)
         text = "设置成功喵~"
-        if is_group:
-            await msg.reply(text=text)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=text)
+        await send_text(msg, text, is_group=is_group)
     except Exception:
         text = "设置失败喵~"
-        if is_group:
-            await msg.reply(text=text)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=text)
+        await send_text(msg, text, is_group=is_group)
 
 @register_command("/set_online_status",help_text = "/set_online_status <在线状态> -> 设置在线状态(管理员)",category = "4",admin_show=True)
 async def handle_set_online_status(msg, is_group=True):
@@ -2476,10 +2167,7 @@ async def handle_set_online_status(msg, is_group=True):
     msgs = msg.raw_message[len("/set_online_status"):].split(" ")[0]
     await bot.api.set_online_status(msgs)
     text = "设置成功喵~"
-    if is_group:
-        await msg.reply(text=text)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=text)
+    await send_text(msg, text, is_group=is_group)
 
 @register_command("/get_friends",help_text = "/get_friends -> 获取好友列表（管理员）",category = "4",admin_show=True)
 async def handle_get_friends(msg, is_group=True):
@@ -2489,10 +2177,7 @@ async def handle_get_friends(msg, is_group=True):
     if str(msg.user_id) not in admin:
         await bot.api.post_private_msg(msg.user_id, text="你没有权限获取好友列表喵~")
     friends = await bot.api.get_friend_list(False)
-    if is_group:
-        await msg.reply(text=friends)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=friends)
+    await send_text(msg, friends, is_group=is_group)
 
 @register_command("/set_qq_avatar",help_text = "/set_qq_avatar <地址> -> 更改头像（管理员）",category = "4",admin_show=True)
 async def handle_set_qq_avatar(msg, is_group=True):
@@ -2507,36 +2192,24 @@ async def handle_set_qq_avatar(msg, is_group=True):
     msgs = msg.raw_message[len("/set_qq_avatar"):]
     await bot.api.set_qq_avatar(msgs)
     text = "设置成功喵~"
-    if is_group:
-        await msg.reply(text=text)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=text)
+    await send_text(msg, text, is_group=is_group)
 
 @register_command("/send_like",help_text = "/send_like <目标QQ号> <次数> -> 发送点赞(admin)",category = "4",admin_show=True)
 async def handle_send_like(msg, is_group=True):
     if str(msg.user_id) not in admin:
-        if is_group:
-            await msg.reply(text="你没有权限发送点赞喵~")
-        else:
-            await bot.api.post_private_msg(msg.user_id, text="你没有权限发送点赞喵~")
+        await send_text(msg, "你没有权限发送点赞喵~", is_group=is_group)
         return
 
     msgs = msg.raw_message[len("/send_like"):].split(" ")
     if len(msgs) < 2:
         text = "格式错误喵~ 请输入 /send_like 目标QQ号 次数"
-        if is_group:
-            await msg.reply(text=text)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=text)
+        await send_text(msg, text, is_group=is_group)
 
     target_qq = msgs[0]
     times = msgs[1]
     await bot.api.send_like(target_qq, times)
     text = "发送成功喵~"
-    if is_group:
-        await msg.reply(text=text)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=text)
+    await send_text(msg, text, is_group=is_group)
 
 @register_command("/set_group_admin",help_text = "/set_group_admin <目标QQ号> -> 设置群管理员(admin)",category = "4",admin_show=True)
 async def handle_set_group_admin(msg, is_group=True):
@@ -2624,10 +2297,7 @@ async def handle_find_book(msg, is_group=True):
     # 检查 Cookie
     cookie_check = check_wenku8_cookie()
     if cookie_check:
-        if is_group:
-            await msg.reply(text=cookie_check)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=cookie_check)
+        await send_text(msg, cookie_check, is_group=is_group)
         return
     
     search_term = ""
@@ -2637,17 +2307,11 @@ async def handle_find_book(msg, is_group=True):
         search_term = msg.raw_message[len("/fb"):].strip()
     if not search_term:
         reply = "请输入要搜索的书名喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
         return
 
     # 发送通知
-    if is_group:
-        await msg.reply(text="正在搜索轻小说喵~")
-    else:
-        await bot.api.post_private_msg(msg.user_id, text="正在搜索轻小说喵~")
+    await send_text(msg, "正在搜索轻小说喵~", is_group=is_group)
 
     # 创建HTML文件
     cache_dir = os.path.join(load_address(), "novel_search")
@@ -2738,29 +2402,20 @@ async def handle_find_author(msg, is_group=True):
     # 检查 Cookie
     cookie_check = check_wenku8_cookie()
     if cookie_check:
-        if is_group:
-            await msg.reply(text=cookie_check)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=cookie_check)
+        await send_text(msg, cookie_check, is_group=is_group)
         return
     
     search_term = msg.raw_message[len("/fa"):].strip()
     if not search_term:
         reply = "请输入要搜索的作者喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
         return
 
     matches = search_wenku8_books(search_term, "author")
 
     if not matches:
         reply = f"没有找到包含'{search_term}'的作者喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
         return
 
     # 生成选择列表
@@ -2769,10 +2424,7 @@ async def handle_find_author(msg, is_group=True):
     # 存储匹配结果临时数据
     temp_selections[msg.user_id] = matches
 
-    if is_group:
-        await msg.reply(text=reply)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=reply)
+    await send_text(msg, reply, is_group=is_group)
 
 def search_wenku8_books(search_term: str, search_type: str, max_pages: int = 3) -> list:
     """
@@ -3103,10 +2755,7 @@ def get_api_book_info(id):
 async def handle_select_book(msg, is_group=True):
     if (msg.user_id not in temp_selections) and (msg.user_id not in api_book):
         reply = "没有找到主人的搜索记录喵~请先使用/findbook搜索喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
         return
     try:
         selection = int(msg.raw_message[len("/select"):].strip()) - 1
@@ -3117,10 +2766,7 @@ async def handle_select_book(msg, is_group=True):
             if selection < len(matches):
                 author,title, url = matches[selection]
                 reply = f"已选择《{title}》-- {author}喵~\n下载链接: {url}"
-                if is_group:
-                    await msg.reply(text=reply)
-                else:
-                    await bot.api.post_private_msg(msg.user_id, text=reply)
+                await send_text(msg, reply, is_group=is_group)
                 # 注意：这里只发送链接，不直接发送文件，因为URL不是本地文件
                 # 如果需要下载文件，需要先下载到本地再发送
             else:
@@ -3139,16 +2785,10 @@ async def handle_select_book(msg, is_group=True):
             
         else:
             reply = "编号无效喵~请选择列表中的编号喵~"
-            if is_group:
-                await msg.reply(text=reply)
-            else:
-                await bot.api.post_private_msg(msg.user_id, text=reply)
+            await send_text(msg, reply, is_group=is_group)
     except ValueError:
         reply = "请输入有效的编号喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
     
     # 安全删除，避免KeyError
     temp_selections.pop(str(msg.user_id), None)
@@ -3159,18 +2799,12 @@ async def handle_info(msg, is_group=True):
     # 检查 Cookie
     cookie_check = check_wenku8_cookie()
     if cookie_check:
-        if is_group:
-            await msg.reply(text=cookie_check)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=cookie_check)
+        await send_text(msg, cookie_check, is_group=is_group)
         return
     
     if (msg.user_id not in temp_selections) and (msg.user_id not in api_book):
         reply = "没有找到您的搜索记录喵~请先使用/findbook搜索喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
         return 
     try:
         selection = int(msg.raw_message[len("/info"):].strip()) - 1
@@ -3262,16 +2896,10 @@ async def handle_info(msg, is_group=True):
 
         else:
             reply = "编号无效喵~请选择列表中的编号喵~"
-            if is_group:
-                await msg.reply(text=reply)
-            else:
-                await bot.api.post_private_msg(msg.user_id, text=reply)
+            await send_text(msg, reply, is_group=is_group)
     except ValueError:
         reply = "请输入有效的编号喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
 
 def get_random_book_from_hotlist() -> tuple:
     """
@@ -3347,10 +2975,7 @@ async def handle_random_novel(msg, is_group=True):
     # 检查 Cookie
     cookie_check = check_wenku8_cookie()
     if cookie_check:
-        if is_group:
-            await msg.reply(text=cookie_check)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=cookie_check)
+        await send_text(msg, cookie_check, is_group=is_group)
         return
     
     # 从今日热门榜单获取随机小说
@@ -3365,10 +2990,7 @@ async def handle_random_novel(msg, is_group=True):
             _log.info(f"从JSON/内存字典随机选择:《{novel}》")
         else:
             reply = "获取随机小说失败喵~请稍后再试~"
-            if is_group:
-                await msg.reply(text=reply)
-            else:
-                await bot.api.post_private_msg(msg.user_id, text=reply)
+            await send_text(msg, reply, is_group=is_group)
             return
     
     url = info["download_url"]
@@ -3398,19 +3020,13 @@ async def handle_hotnovel(msg, is_group=True):
     # 检查 Cookie
     cookie_check = check_wenku8_cookie()
     if cookie_check:
-        if is_group:
-            await msg.reply(text=cookie_check)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=cookie_check)
+        await send_text(msg, cookie_check, is_group=is_group)
         return
     
     parts = msg.raw_message.split()
     if len(parts) < 2:
         reply = "请输入查询类型喵~ 例如：/hotnovel day 或 /hotnovel month"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
         return
 
     rank_type = parts[1].lower()
@@ -3423,10 +3039,7 @@ async def handle_hotnovel(msg, is_group=True):
         type_name = "本月热门"
     else:
         reply = "目前只支持 day 或 month 喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
         return
 
     requested_count = 10
@@ -3464,10 +3077,7 @@ async def handle_hotnovel(msg, is_group=True):
             if response.status_code == 403:
                 _log.warning("热门榜单返回403错误，Cookie可能已失效或被反爬虫机制拦截")
                 reply = "❌ 榜单获取失败，Cookie 可能已失效喵！\n请管理员使用 `/set_wenku_cookie <新Cookie>` 命令更新 Cookie 喵~"
-                if is_group:
-                    await msg.reply(text=reply)
-                else:
-                    await bot.api.post_private_msg(msg.user_id, text=reply)
+                await send_text(msg, reply, is_group=is_group)
                 return
             
             pattern = r'<div style="width:373px;height:136px;float:left;margin:5px 0px 5px 5px;">(.*?)</div>\s*</div>'
@@ -3481,10 +3091,7 @@ async def handle_hotnovel(msg, is_group=True):
                     else:
                         reply = "没找到热门榜单喵，可能网页结构变了喵~"
                     
-                    if is_group:
-                        await msg.reply(text=reply)
-                    else:
-                        await bot.api.post_private_msg(msg.user_id, text=reply)
+                    await send_text(msg, reply, is_group=is_group)
                     return
                 else:
                     # 如果不是第一页没结果，说明到底了
@@ -3585,20 +3192,14 @@ async def handle_hotnovel(msg, is_group=True):
     except Exception as e:
         _log.error(f"Error in handle_hotnovel: {e}")
         reply = "获取热门榜单失败了喵，请稍后再试喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
 
 @register_command("/novel_res", help_text="/novel_res <res值> -> 根据res编号下载轻小说", category="6")
 async def handle_novel_by_res(msg, is_group=True):
     res_value = msg.raw_message[len("/novel_res"):].strip()
     if not res_value:
         reply = "请输入要下载的res编号喵~例如：/novel_res 1121"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
         return
 
     target_title = None
@@ -3623,10 +3224,7 @@ async def handle_novel_by_res(msg, is_group=True):
     download_url = target_info.get("download_url")
     if not download_url:
         reply = "该轻小说没有可用的下载链接喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
         return
 
     reply = f"已开始下载《{target_title}》喵~"
@@ -3641,27 +3239,18 @@ async def handle_novel_by_res(msg, is_group=True):
 async def handle_set_wenku_cookie(msg, is_group=True):
     if str(msg.user_id) not in admin:
         reply = "主人，这个功能只有管理员才能使用喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
         return
 
     new_cookie = msg.raw_message[len("/set_wenku_cookie"):].strip()
     if not new_cookie:
         reply = "请输入新的 Cookie 喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
         return
 
     save_wenku8_cookie(new_cookie)
     reply = "✅ Cookie 更新成功喵！现在可以尝试使用 /hotnovel 喵~"
-    if is_group:
-        await msg.reply(text=reply)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=reply)
+    await send_text(msg, reply, is_group=is_group)
 
 mc = {}
 @register_command("/mc",help_text = "/mc <服务器地址> -> 发送mc服务器状态",category = "3")
@@ -3683,10 +3272,7 @@ async def handle_mc(msg, is_group=True):
             server = mc[str(msg.user_id)]
         else:
             reply = "请输入服务器地址或使用/mc_bind进行绑定喵~"
-            if is_group:
-                await msg.reply(text=reply)
-            else:
-                await bot.api.post_private_msg(msg.user_id, text=reply)
+            await send_text(msg, reply, is_group=is_group)
             return
     
     try:
@@ -3694,41 +3280,26 @@ async def handle_mc(msg, is_group=True):
         server = mcstatus.JavaServer.lookup(server)
         status = server.status()
         reply = f"服务器状态如下喵~\n服务器描述：{status.description}\n版本: {status.version.name}\n在线人数: {status.players.online}\n最大人数: {status.players.max}\n延迟: {int(status.latency)}ms"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
     except ImportError:
         reply = "未安装mcstatus库喵~请使用pip install mcstatus进行安装喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
     except Exception:
         reply = "获取服务器状态失败喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
 
 @register_command("/mc_bind",help_text = "/mc_bind <服务器地址> -> 绑定mc服务器",category = "3")
 async def handle_mc_bind(msg, is_group=True):
     server = msg.raw_message[len("/mc_bind"):].strip()
     if not server:
         reply = "请输入服务器地址喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
         return
     mc[str(msg.user_id)] = server
     with open("mc.txt", "a") as f:
         f.write(f"{msg.user_id}:{server}\n")
     reply = "绑定成功喵~"
-    if is_group:
-        await msg.reply(text=reply)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=reply)
+    await send_text(msg, reply, is_group=is_group)
 
 @register_command("/mc_unbind",help_text = "/mc_unbind -> 解绑mc服务器",category = "3")
 async def handle_mc_unbind(msg, is_group=True):
@@ -3741,31 +3312,19 @@ async def handle_mc_unbind(msg, is_group=True):
                 if line.split(":")[0] != str(msg.user_id):
                     f.write(line)
         reply = "解绑成功喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
     else:
         reply = "你没有绑定过mc服务器喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
 
 @register_command("/mc_show",help_text = "/mc_show -> 查看绑定的mc服务器",category = "3")
 async def handle_mc_show(msg, is_group=True):
     if str(msg.user_id) in mc:
         reply = f"你绑定的mc服务器是：{mc[str(msg.user_id)]}"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
     else:
         reply = "你没有绑定过mc服务器喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
 
 @register_command("/generate_photo","/gf",help_text = "/generate_photo 或 /gf <图片描述(不能有空格)> <大小> -> 生成图片",category = "3")
 async def handle_gf(msg,is_group=True):
@@ -3833,10 +3392,7 @@ async def handle_gf(msg,is_group=True):
     except Exception as e:
         reply = f"绘制失败喵~,{e}\n{response.json()}"
 
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
         return
     if is_group:
         await msg.reply(text="绘制完成喵~")
@@ -3876,10 +3432,7 @@ async def handle_workspace(msg, is_group=True):
     """查看当前会话的工作区文件列表"""
     if not WORKSPACE_AVAILABLE:
         reply = "工作区功能不可用喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
         return
 
     from nbot.core.workspace import workspace_manager
@@ -3906,20 +3459,14 @@ async def handle_workspace(msg, is_group=True):
                 size_str = f"{size_kb/1024:.2f} MB"
             reply += f"  {f['name']} ({size_str})\n"
 
-    if is_group:
-        await msg.reply(text=reply)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=reply)
+    await send_text(msg, reply, is_group=is_group)
 
 @register_command("/ws_send", help_text="/ws_send <文件名> -> 发送工作区中的文件", category="3")
 async def handle_ws_send(msg, is_group=True):
     """发送工作区中的文件给用户"""
     if not WORKSPACE_AVAILABLE:
         reply = "工作区功能不可用喵~"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
         return
 
     from nbot.core.workspace import workspace_manager
@@ -3929,10 +3476,7 @@ async def handle_ws_send(msg, is_group=True):
     filename = raw[len("/ws_send"):].strip()
     if not filename:
         reply = "请指定文件名喵~ 用法: /ws_send 文件名"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
         return
 
     if is_group:
@@ -3943,24 +3487,15 @@ async def handle_ws_send(msg, is_group=True):
     file_path = workspace_manager.get_file_path(session_id, filename)
     if not file_path:
         reply = f"文件不存在喵~: {filename}"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
         return
 
     file_path = normalize_file_path(file_path)
     try:
-        if is_group:
-            await bot.api.post_group_file(msg.group_id, file=file_path)
-        else:
-            await bot.api.upload_private_file(msg.user_id, file_path, os.path.basename(file_path))
+        await send_file(msg, file_path, is_group=is_group, filename=os.path.basename(file_path))
     except Exception as e:
         reply = f"发送文件失败喵~: {e}"
-        if is_group:
-            await msg.reply(text=reply)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=reply)
+        await send_text(msg, reply, is_group=is_group)
 
 #将help命令放在最后
 @register_command("/help","/h",help_text = "/help 或者 /h -> 查看帮助",category = "8")
@@ -4020,10 +3555,7 @@ async def handle_help(msg, is_group=True):
                 for cmd_text in command_categories[selected_category]['commands']:
                     help_text += f"{cmd_text}\n"
                 
-            if is_group:
-                await msg.reply(text=help_text)
-            else:
-                await bot.api.post_private_msg(msg.user_id, text=help_text)
+            await send_text(msg, help_text, is_group=is_group)
             return
 
     # 显示主帮助菜单
@@ -4035,10 +3567,7 @@ async def handle_help(msg, is_group=True):
 
     help_text += "\n\n 一共有"+str(len(command_handlers))+"个命令"
     
-    if is_group:
-        await msg.reply(text=help_text)
-    else:
-        await bot.api.post_private_msg(msg.user_id, text=help_text)
+    await send_text(msg, help_text, is_group=is_group)
 
 def get_all_help_text_for_prompt() -> str:
     command_categories = {
@@ -4149,26 +3678,17 @@ async def handle_api(msg,is_group):
         return
     if str(msg.user_id) not in admin:
         text = "没有权限喵~"
-        if is_group:
-            await msg.reply(text=text)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=text)
+        await send_text(msg, text, is_group=is_group)
         return
     # 将命令字符串转换为bot.api中的方法
     try:
         func = getattr(bot.api, command.split('.')[-1])
         res = await func(**params)
         res = str(res)
-        if is_group:
-            await msg.reply(text=res)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=res)
+        await send_text(msg, res, is_group=is_group)
     except Exception as e:
         text = f"执行命令时出错喵~：{e}"
-        if is_group:
-            await msg.reply(text=text)
-        else:
-            await bot.api.post_private_msg(msg.user_id, text=text)
+        await send_text(msg, text, is_group=is_group)
 
 
 async def handle_group_message(msg):
