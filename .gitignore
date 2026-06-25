@@ -11,3 +11,4 @@ resources
 **/tmp/
 nbot/plugins/bilibili
 !resources/prompts/
+config.ini
