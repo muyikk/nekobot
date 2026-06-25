@@ -1,5 +1,5 @@
 from ncatbot.core import BotClient, GroupMessage, PrivateMessage, BotAPI
-from ncatbot.utils.logger import get_log
+from nbot.utils.logger import get_logger
 from nbot.core.heartbeat import HeartbeatCore
 
 from nbot.web.utils.config_loader import load_config
@@ -40,7 +40,7 @@ from ncatbot.core import (
 
 if_tts = False #判断是否开启TTS
 
-_log = get_log()
+_log = get_logger(__name__)
 
 def normalize_file_path(path: str) -> str:
     """

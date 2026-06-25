@@ -2,54 +2,48 @@ import importlib
 import os
 import threading
 
-from dotenv import load_dotenv
-
 # Skip ncatbot's GitHub proxy auto-detection during startup.
 # None means "probe proxies"; empty string means "connect directly".
 os.environ.setdefault("GITHUB_PROXY", "")
 
 from ncatbot.utils.config import config as ncatbot_config
-from ncatbot.utils.logger import get_log
+from nbot.utils.logger import setup_logging, get_logger
+from nbot.config import get_config
 
+# 尽早初始化日志
+setup_logging()
+_log = get_logger(__name__)
 
-def _load_env_file():
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
-    if os.path.exists(env_path):
-        load_dotenv(env_path)
-    else:
-        load_dotenv()
-
-
-_load_env_file()
+# 加载 .env 配置
+_config = get_config()
 
 
 def _apply_runtime_ncatbot_config():
-    bot_uin = os.getenv("BOT_UIN")
+    bot_uin = _config.get("BOT__UIN")
     if bot_uin:
         ncatbot_config.set_bot_uin(bot_uin)
 
-    root = os.getenv("ROOT")
+    root = _config.get("ROOT")
     if root:
         ncatbot_config.set_root(root)
 
-    ws_uri = os.getenv("WS_URI")
+    ws_uri = _config.get("WS_URI")
     if ws_uri:
         ncatbot_config.set_ws_uri(ws_uri)
 
-    token = os.getenv("TOKEN")
+    token = _config.get("TOKEN")
     if token:
         ncatbot_config.set_token(token)
 
-    webui_uri = os.getenv("WEBUI_URI")
+    webui_uri = _config.get("WEBUI_URI")
     if webui_uri:
         ncatbot_config.set_webui_uri(webui_uri)
 
 
 _apply_runtime_ncatbot_config()
 
-_log = get_log()
+
 _commands_module = None
-web_server_instance = None
 _pending_qq_bot = None
 _web_server_started = threading.Event()
 
@@ -81,11 +75,6 @@ def _set_web_server_bot(bot):
 def _prepare_web_server(bot=None):
     global web_server_instance
     from nbot.web import create_web_app
-    import logging
-
-    werkzeug_log = logging.getLogger("werkzeug")
-    werkzeug_log.setLevel(logging.ERROR)
-    werkzeug_log.disabled = True
 
     app, socketio, web_server = create_web_app()
     web_server_instance = web_server
@@ -148,11 +137,11 @@ def run_cli():
     except ImportError as e:
         _log.error(f"Failed to import CLI module: {e}")
         _log.info("Install rich to enable CLI: pip install rich")
-        print("\n错误: 需要安装 rich 库")
-        print("请运行: pip install rich")
+        _log.error("错误: 需要安装 rich 库")
+        _log.info("请运行: pip install rich")
     except Exception as e:
         _log.error(f"CLI error: {e}")
-        print(f"\nCLI错误: {e}")
+        _log.error(f"CLI错误: {e}")
 
 
 def run_cli_and_web(host="0.0.0.0", port=5000):
