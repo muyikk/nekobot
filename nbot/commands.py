@@ -12,7 +12,7 @@ import base64
 import hashlib
 import html
 import jmcomic
-import requests
+from nbot.utils.http_client import get_sync, post_sync, head_sync
 import random
 import configparser
 import json
@@ -1795,7 +1795,7 @@ async def async_send_file(is_group,send_method, target_id, file_type, url,file_n
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
-        response = await loop.run_in_executor(None, lambda: requests.get(url, allow_redirects=True, timeout=10,headers=headers))
+        response = await loop.run_in_executor(None, lambda: get_sync(url, allow_redirects=True, timeout=10,headers=headers))
         final_url = response.url
 
         # 异步发送文件
@@ -1921,7 +1921,7 @@ async def handle_random_emoticons(msg, is_group=True):
 @register_command("/st",help_text = "/st <标签名> -> 发送随机涩图,标签支持与或(& |)",category = "3")
 async def handle_st(msg, is_group=True):
     tags = msg.raw_message[len("/st"):].strip()
-    res = requests.get(f"https://api.lolicon.app/setu/v2?tag={tags}").json().get("data")[0].get("urls").get("original")
+    res = get_sync(f"https://api.lolicon.app/setu/v2?tag={tags}").json().get("data")[0].get("urls").get("original")
     await handle_generic_file(msg, is_group,"","image",custom_url=res)  # 特殊处理API调用
 
 
@@ -1953,7 +1953,7 @@ async def handle_loli(msg, is_group=True):
         params = {"r18": 0, "num": num, "size": "original"}
         if tag:
             params["tag"] = tag
-        data = requests.get("https://api.lolicon.app/setu/v2", params=params, timeout=30).json()
+        data = get_sync("https://api.lolicon.app/setu/v2", params=params, timeout=30).json()
         if data.get("error"):
             await msg.reply(text=f"获取失败: {data['error']}")
             return
@@ -1977,7 +1977,7 @@ async def handle_r18(msg, is_group=True):
         params = {"r18": 1, "num": num, "size": "original"}
         if tag:
             params["tag"] = tag
-        data = requests.get("https://api.lolicon.app/setu/v2", params=params, timeout=30).json()
+        data = get_sync("https://api.lolicon.app/setu/v2", params=params, timeout=30).json()
         if data.get("error"):
             await msg.reply(text=f"获取失败: {data['error']}")
             return
@@ -2080,7 +2080,7 @@ async def handle_music(msg, is_group=True):
         'type': 1,  # 1表示歌曲
         'limit': 1  # 获取第一条结果
     }
-    response = requests.get(url, params=params)
+    response = get_sync(url, params=params)
     data = response.json()
     if data['code'] == 200 and data['result']['songs']:
         music_id = data['result']['songs'][0]['id']
@@ -2094,7 +2094,7 @@ async def handle_music(msg, is_group=True):
 
 @register_command("/random_music","/rm",help_text = "/random_music 或者 /rm -> 发送随机音乐",category = "3")
 async def handle_random_music(msg, is_group=True):
-    id = requests.get("https://api.mtbbs.top/Music/song/?id=2645495145").json()["data"]["id"]
+    id = get_sync("https://api.mtbbs.top/Music/song/?id=2645495145").json()["data"]["id"]
     messagechain = MessageChain(
         Music(type="163",id=id)
     )
@@ -2607,7 +2607,7 @@ def get_novel_api_base_url():
     for base_url in NOVEL_API_BASE_URLS:
         try:
             url = f"{base_url.rstrip('/')}/api/search"
-            res = requests.get(url, params={"key": "test", "tab_type": 3}, timeout=5)
+            res = get_sync(url, params={"key": "test", "tab_type": 3}, timeout=5)
             if not res.ok:
                 continue
             data = res.json()
@@ -2807,7 +2807,7 @@ def search_wenku8_books(search_term: str, search_type: str, max_pages: int = 3) 
         url = f"https://www.wenku8.net/modules/article/search.php?searchtype={search_type}&searchkey={encoded_key}&page={page}"
         _log.info(f"搜索URL (第{page}页): {url}")
         try:
-            response = requests.get(url, headers=headers, timeout=10)
+            response = get_sync(url, headers=headers, timeout=10)
             _log.info(f"搜索响应状态码: {response.status_code}")
         except Exception as e:
             _log.error(f"搜索请求失败: {e}")
@@ -2933,7 +2933,7 @@ def get_book_detail_by_url(book_url: str) -> dict:
 
     _log.info(f"获取小说详情: {book_url}")
     try:
-        response = requests.get(book_url, headers=headers, timeout=10)
+        response = get_sync(book_url, headers=headers, timeout=10)
         _log.info(f"详情页响应状态码: {response.status_code}")
         
         # 检查网站是否关闭
@@ -3016,7 +3016,7 @@ def find_book_from_api(search_term: str) -> list:
         "tab_type": 3,
     }
     try:
-        res = requests.get(url, params=params, timeout=10)
+        res = get_sync(url, params=params, timeout=10)
     except Exception:
         return {}
     book_ids = {}
@@ -3046,7 +3046,7 @@ def download_api_book(id,name):
         "book_id":id
     }
     try:
-        response = requests.get(url, params=params, timeout=30)
+        response = get_sync(url, params=params, timeout=30)
     except Exception as e:
         _log.error(f"下载失败：{e}")
         return
@@ -3070,7 +3070,7 @@ def get_api_book_info(id):
         "book_id":id
     }
     try:
-        response = requests.get(url, params=params, timeout=10)
+        response = get_sync(url, params=params, timeout=10)
     except Exception as e:
         _log.error(f"获取失败：{e}")
         return None
@@ -3291,7 +3291,7 @@ def get_random_book_from_hotlist() -> tuple:
     
     _log.info(f"获取热门榜单: {url}")
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = get_sync(url, headers=headers, timeout=10)
         _log.info(f"热门榜单响应状态码: {response.status_code}")
         response.encoding = 'gbk'
         content = response.text
@@ -3456,7 +3456,7 @@ async def handle_hotnovel(msg, is_group=True):
     try:
         while len(all_matches) < requested_count:
             url = f"{base_url}&page={current_page}"
-            response = requests.get(url, headers=headers, timeout=10)
+            response = get_sync(url, headers=headers, timeout=10)
             response.encoding = 'gbk'
             content = response.text
             
@@ -3826,7 +3826,7 @@ async def handle_gf(msg,is_group=True):
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
     }
-    response = requests.post(url, json=payload, headers=headers)
+    response = post_sync(url, json=payload, headers=headers)
 
     try:
         url = response.json().get("data")[0].get("url")
@@ -4342,7 +4342,7 @@ def _save_incoming_files_to_workspace(msg, is_group: bool):
                 _log.info(f"[文件保存] 发现文件: {file_name}, URL: {file_url[:50] if file_url else '空'}...")
                 if file_url:
                     try:
-                        resp = requests.get(file_url, timeout=30)
+                        resp = get_sync(file_url, timeout=30)
                         _log.info(f"[文件保存] 下载响应: {resp.status_code}")
                         if resp.status_code == 200:
                             result = workspace_manager.save_uploaded_file(
@@ -4416,7 +4416,7 @@ def _save_incoming_files_to_workspace(msg, is_group: bool):
                                 ]
                                 for url in possible_urls:
                                     try:
-                                        resp = requests.head(url, timeout=5)
+                                        resp = head_sync(url, timeout=5)
                                         if resp.status_code == 200:
                                             file_url = url
                                             _log.info(f"[文件保存] 找到可用下载链接: {file_url[:50]}...")
@@ -4428,7 +4428,7 @@ def _save_incoming_files_to_workspace(msg, is_group: bool):
                 
                 if file_url:
                     try:
-                        resp = requests.get(file_url, timeout=30)
+                        resp = get_sync(file_url, timeout=30)
                         _log.info(f"[文件保存] 下载响应: {resp.status_code}")
                         if resp.status_code == 200:
                             result = workspace_manager.save_uploaded_file(

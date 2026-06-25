@@ -3,7 +3,8 @@
 """
 import json
 import logging
-import urllib.request
+import urllib.parse
+from nbot.utils.http_client import get_sync, HTTPClientError
 import urllib.parse
 import os
 import difflib
@@ -541,15 +542,14 @@ class ToolExecutor:
             # 使用 wttr.in 免费天气服务
             url = f"https://wttr.in/{urllib.parse.quote(city)}?format=j1"
 
-            req = urllib.request.Request(
+            response = get_sync(
                 url,
                 headers={
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.0'
-                }
+                },
+                timeout=10,
             )
-
-            with urllib.request.urlopen(req, timeout=10) as response:
-                data = json.loads(response.read().decode('utf-8'))
+            data = response.json()
 
             current = data.get('current_condition', [{}])[0]
             weather = {
@@ -582,7 +582,6 @@ class ToolExecutor:
         使用搜狗搜索（无需 API key），并抓取页面正文获取详细内容
         """
         try:
-            import requests
             from bs4 import BeautifulSoup
             from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -596,7 +595,7 @@ class ToolExecutor:
             # 搜狗搜索
             search_url = "https://www.sogou.com/web"
             search_params = {"query": query, "num": str(num_results * 2)}
-            response = requests.get(search_url, headers=headers, params=search_params, timeout=15)
+            response = get_sync(search_url, headers=headers, params=search_params, timeout=15)
             response.encoding = 'utf-8'
 
             soup = BeautifulSoup(response.text, 'html.parser')
@@ -651,7 +650,7 @@ class ToolExecutor:
                     return url
                 try:
                     import re as _re
-                    resp = requests.get(url, headers=headers, timeout=5)
+                    resp = get_sync(url, headers=headers, timeout=5)
                     match = _re.search(r'window\.location\.replace\("(.*?)"\)', resp.text)
                     if match:
                         return match.group(1)
@@ -666,7 +665,7 @@ class ToolExecutor:
                 """抓取页面并提取正文文本，返回 (真实URL, 正文内容)"""
                 try:
                     real_url = resolve_sogou_url(url)
-                    resp = requests.get(real_url, headers=headers, timeout=8, allow_redirects=True)
+                    resp = get_sync(real_url, headers=headers, timeout=8, allow_redirects=True)
                     resp.encoding = resp.apparent_encoding or 'utf-8'
                     page_soup = BeautifulSoup(resp.text, 'html.parser')
 
@@ -718,7 +717,7 @@ class ToolExecutor:
                 "answer": answer.strip()
             }
 
-        except requests.exceptions.RequestException as e:
+        except HTTPClientError as e:
             _log.error(f"[Search] 请求错误: {e}")
             return {
                 "success": False,
@@ -760,21 +759,20 @@ class ToolExecutor:
     def http_get(url: str) -> Dict[str, Any]:
         """HTTP GET 请求"""
         try:
-            req = urllib.request.Request(
+            response = get_sync(
                 url,
                 headers={
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
+                },
+                timeout=30,
             )
-
-            with urllib.request.urlopen(req, timeout=30) as response:
-                content = response.read().decode('utf-8', errors='ignore')
-                return {
-                    "success": True,
-                    "url": url,
-                    "status": response.status,
-                    "content": content[:5000]  # 限制返回内容长度
-                }
+            content = response.text
+            return {
+                "success": True,
+                "url": url,
+                "status": response.status_code,
+                "content": content[:5000]  # 限制返回内容长度
+            }
 
         except Exception as e:
             _log.error(f"HTTP GET error: {e}")
@@ -912,18 +910,17 @@ class ToolExecutor:
             filename = os.path.basename(filename)  # 移除路径
             
             # 下载文件
-            req = urllib.request.Request(
+            _log.info(f"Downloading file from {url} to workspace {workspace_id}")
+
+            response = get_sync(
                 url,
                 headers={
                     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-                }
+                },
+                timeout=60,
             )
-            
-            _log.info(f"Downloading file from {url} to workspace {workspace_id}")
-            
-            with urllib.request.urlopen(req, timeout=60) as response:
-                content = response.read()
-                content_type = response.headers.get('Content-Type', 'application/octet-stream')
+            content = response.content
+            content_type = response.headers.get('Content-Type', 'application/octet-stream')
                 
             # 确定文件类型
             file_type = 'file'
