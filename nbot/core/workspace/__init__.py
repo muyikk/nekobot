@@ -1,8 +1,9 @@
 """
-工作区管理模块（向后兼容 shim）
+工作区管理子包
 
-实际实现已迁移至 nbot.core.workspace 子包。
-此文件保留以兼容旧导入路径。
+提供：
+- WorkspaceManager: 工作区管理器单例
+- _resolve_within / _normalize_edit_block / _replace_content_block: 工具函数
 """
 
 from nbot.core.workspace.utils import (

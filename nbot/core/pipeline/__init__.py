@@ -1,8 +1,11 @@
 """
-统一 AI 处理管道中间件（向后兼容 shim）
+AI 处理管道子包
 
-实际实现已迁移至 nbot.core.pipeline 子包。
-此文件保留以兼容旧导入路径。
+提供统一的 AI 处理管道：
+- AIPipeline: 管道主类
+- PipelineContext / PipelineResult: 上下文与结果数据类
+- PipelineCallbacks / ProgressReporter / NoOpProgressReporter: 频道回调接口
+- handle_tool_confirmation: 工具确认处理
 """
 
 from nbot.core.pipeline.pipeline import (

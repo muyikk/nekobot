@@ -1,0 +1,433 @@
+"""
+工作区文件操作混入类
+
+提供工作区中文件的创建、读取、编辑、删除、列表等操作方法。
+作为 WorkspaceManager 的混入基类使用。
+（文件引用管理已拆分到 references.py 中的 WorkspaceReferenceMixin）
+"""
+
+import os
+import shutil
+import mimetypes
+from typing import Optional, Dict, Any, List
+
+from .utils import _resolve_within, _replace_content_block
+
+
+class WorkspaceFileOpsMixin:
+    """工作区文件操作混入类。
+
+    所有方法依赖 self.workspaces_dir / self.shared_workspace_dir / self._meta
+    等由 WorkspaceManager 提供的属性。
+    """
+
+    # 文件上传方法已移至 upload.py 中的 WorkspaceUploadMixin
+
+    # ========== 文件创建 ==========
+
+    def create_file(self, session_id: str, filename: str, content: str,
+                    session_type: str = "unknown") -> Dict[str, Any]:
+        """在工作区中创建/覆盖文本文件（供 AI 工具调用）。
+
+        Args:
+            session_id: 会话ID
+            filename: 文件名
+            content: 文件内容
+
+        Returns:
+            操作结果
+        """
+        ws_path = self.get_or_create(session_id, session_type)
+        safe_name = self._safe_filename(filename)
+
+        # 支持子目录，但限制在工作区内
+        file_path = os.path.normpath(os.path.join(ws_path, safe_name))
+        if not file_path.startswith(os.path.normpath(ws_path)):
+            return {'success': False, 'error': '路径不合法，不能超出工作区范围'}
+
+        # 确保父目录存在（必须在工作区内）
+        parent_dir = os.path.dirname(file_path)
+        if not parent_dir.startswith(os.path.normpath(ws_path)):
+            return {'success': False, 'error': '路径不合法，不能超出工作区范围'}
+
+        try:
+            if parent_dir != ws_path:
+                os.makedirs(parent_dir, exist_ok=True)
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(content)
+            return {
+                'success': True,
+                'filename': safe_name,
+                'path': file_path,
+                'size': len(content.encode('utf-8'))
+            }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    # ========== 文件读取 ==========
+
+    def read_file(self, session_id: str, filename: str,
+                  start_line: int = None, end_line: int = None,
+                  char_count: int = None, start_char: int = None) -> Dict[str, Any]:
+        """读取工作区中的文件内容（供 AI 工具调用）。
+
+        Args:
+            session_id: 会话ID
+            filename: 文件名
+            start_line: 开始行号（从1开始）
+            end_line: 结束行号（包含）
+            char_count: 读取的字符数量
+            start_char: 从第几个字符开始（从0开始）
+
+        Returns:
+            文件内容或错误信息
+        """
+        ws_path = self.get_workspace(session_id)
+        if not ws_path:
+            return {'success': False, 'error': '工作区不存在'}
+
+        file_path = os.path.normpath(os.path.join(ws_path, filename))
+        if not file_path.startswith(os.path.normpath(ws_path)):
+            return {'success': False, 'error': '路径不合法'}
+
+        if not os.path.exists(file_path):
+            return {'success': False, 'error': f'文件不存在: {filename}'}
+
+        mime_type, _ = mimetypes.guess_type(file_path)
+        is_text = mime_type and (
+            mime_type.startswith('text/') or
+            mime_type in ['application/json', 'application/xml', 'application/yaml',
+                          'application/javascript', 'application/x-python']
+        )
+
+        # 对于无法识别 mime 的文件，尝试按文本读取
+        if not mime_type:
+            is_text = True
+
+        if is_text:
+            try:
+                with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                    content = f.read()
+
+                # 应用字符范围参数
+                if char_count is not None:
+                    start_pos = start_char if start_char is not None else 0
+                    if start_pos < len(content):
+                        content = content[start_pos:start_pos + char_count]
+                    else:
+                        content = ""
+
+                # 应用行范围参数
+                if start_line is not None or end_line is not None:
+                    lines = content.split('\n')
+                    start = max(0, (start_line - 1) if start_line else 0)
+                    end = min(len(lines), end_line if end_line else len(lines))
+                    if start < end:
+                        content = '\n'.join(lines[start:end])
+                        if end_line and end < len(lines):
+                            content += '\n...'
+                    else:
+                        content = ""
+
+                # 限制返回大小（如果没有指定具体范围）
+                if not any([char_count, start_char, start_line, end_line]):
+                    if len(content) > 50000:
+                        content = content[:50000] + "\n...(内容过长，已截断)"
+
+                return {
+                    'success': True,
+                    'filename': filename,
+                    'content': content,
+                    'size': os.path.getsize(file_path),
+                    'mime_type': mime_type or 'text/plain'
+                }
+            except Exception:
+                pass
+
+        # 二进制文件只返回元信息
+        return {
+            'success': True,
+            'filename': filename,
+            'content': f'[二进制文件，大小: {os.path.getsize(file_path)} 字节]',
+            'size': os.path.getsize(file_path),
+            'mime_type': mime_type or 'application/octet-stream',
+            'is_binary': True
+        }
+
+    # ========== 文件编辑 ==========
+
+    def edit_file(self, session_id: str, filename: str,
+                  old_content: str, new_content: str) -> Dict[str, Any]:
+        """修改工作区中的文件（查找替换方式，供 AI 工具调用）。
+
+        Args:
+            session_id: 会话ID
+            filename: 文件名
+            old_content: 要替换的原始内容
+            new_content: 替换后的新内容
+
+        Returns:
+            操作结果
+        """
+        ws_path = self.get_workspace(session_id)
+        if not ws_path:
+            return {'success': False, 'error': '工作区不存在'}
+
+        file_path = os.path.normpath(os.path.join(ws_path, filename))
+        if not file_path.startswith(os.path.normpath(ws_path)):
+            return {'success': False, 'error': '路径不合法'}
+
+        if not os.path.exists(file_path):
+            return {'success': False, 'error': f'文件不存在: {filename}'}
+
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+
+            new_file_content, match_mode = _replace_content_block(
+                content, old_content, new_content
+            )
+            if new_file_content is None:
+                return {'success': False, 'error': '未找到要替换的内容'}
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(new_file_content)
+
+            return {
+                'success': True,
+                'filename': filename,
+                'size': len(new_file_content.encode('utf-8')),
+                'match_mode': match_mode,
+            }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    # ========== 文件删除 ==========
+
+    def delete_file(self, session_id: str, filename: str) -> Dict[str, Any]:
+        """删除工作区中的文件或文件夹（供 AI 工具调用）。"""
+        ws_path = self.get_workspace(session_id)
+        if not ws_path:
+            return {'success': False, 'error': '工作区不存在'}
+
+        file_path = os.path.normpath(os.path.join(ws_path, filename))
+        if not file_path.startswith(os.path.normpath(ws_path)):
+            return {'success': False, 'error': '路径不合法'}
+
+        if not os.path.exists(file_path):
+            return self.delete_file_reference(session_id, filename)
+
+        try:
+            if os.path.isdir(file_path):
+                shutil.rmtree(file_path)
+            else:
+                os.remove(file_path)
+            return {'success': True, 'filename': filename}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    # ========== 文件列表 ==========
+
+    def list_files(self, session_id: str, path: str = '') -> Dict[str, Any]:
+        """列出工作区中的文件。
+
+        Args:
+            session_id: 会话ID
+            path: 子目录路径（可选），为空则列出根目录
+        """
+        ws_path = self.get_workspace(session_id)
+        if not ws_path:
+            return {'success': True, 'files': [], 'message': '工作区为空'}
+
+        # 如果指定了路径，列出该目录的内容
+        if path:
+            target_path = _resolve_within(ws_path, path)
+            if not target_path:
+                return {'success': False, 'error': '路径不合法'}
+            if not os.path.exists(target_path) or not os.path.isdir(target_path):
+                return {'success': False, 'error': '目录不存在'}
+
+            files = []
+            try:
+                for name in os.listdir(target_path):
+                    full_path = os.path.join(target_path, name)
+                    if os.path.isdir(full_path):
+                        files.append({
+                            'name': name,
+                            'type': 'directory',
+                            'size': 0,
+                            'path': path + '/' + name if path else name
+                        })
+                    else:
+                        mime_type, _ = mimetypes.guess_type(full_path)
+                        files.append({
+                            'name': name,
+                            'type': 'file',
+                            'size': os.path.getsize(full_path),
+                            'mime_type': mime_type or 'application/octet-stream',
+                            'path': path + '/' + name if path else name
+                        })
+            except Exception as e:
+                return {'success': False, 'error': str(e)}
+
+            return {'success': True, 'files': files, 'count': len(files)}
+
+        # 列出根目录
+        files = []
+        try:
+            for name in os.listdir(ws_path):
+                full_path = os.path.join(ws_path, name)
+                if os.path.isdir(full_path):
+                    files.append({
+                        'name': name,
+                        'type': 'directory',
+                        'size': 0,
+                        'path': name
+                    })
+                else:
+                    mime_type, _ = mimetypes.guess_type(full_path)
+                    files.append({
+                        'name': name,
+                        'type': 'file',
+                        'size': os.path.getsize(full_path),
+                        'mime_type': mime_type or 'application/octet-stream',
+                        'path': name
+                    })
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+        if not path:
+            for ref in self._get_file_references(session_id):
+                source_path = ref.get("source_path")
+                if not source_path or not os.path.exists(source_path):
+                    continue
+                files.append({
+                    'name': ref.get('name', os.path.basename(source_path)),
+                    'type': 'file',
+                    'size': ref.get('size', os.path.getsize(source_path)),
+                    'mime_type': ref.get('mime_type', 'application/octet-stream'),
+                    'path': ref.get('path', ref.get('name', '')),
+                    'scope': 'private',
+                    'reference': True,
+                    'reference_kind': ref.get('reference_kind', 'external'),
+                })
+
+        return {'success': True, 'files': files, 'count': len(files)}
+
+    def list_files_recursive(self, session_id: str, path: str = '') -> Dict[str, Any]:
+        """递归列出工作区中所有子目录的文件。"""
+        ws_path = self.get_workspace(session_id)
+        if not ws_path:
+            return {'success': True, 'files': [], 'message': '工作区为空'}
+
+        target_path = _resolve_within(ws_path, path)
+        if not target_path:
+            return {'success': False, 'error': '路径不合法'}
+        if not os.path.exists(target_path) or not os.path.isdir(target_path):
+            return {'success': False, 'error': '目录不存在'}
+
+        all_items = []
+
+        def scan_directory(current_path: str, relative_prefix: str = ''):
+            try:
+                for name in os.listdir(current_path):
+                    full_path = os.path.join(current_path, name)
+                    relative_path = relative_prefix + '/' + name if relative_prefix else name
+
+                    if os.path.isdir(full_path):
+                        all_items.append({
+                            'name': name,
+                            'type': 'directory',
+                            'size': 0,
+                            'path': relative_path,
+                            'scope': 'private'
+                        })
+                        scan_directory(full_path, relative_path)
+                    else:
+                        mime_type, _ = mimetypes.guess_type(full_path)
+                        all_items.append({
+                            'name': name,
+                            'type': 'file',
+                            'size': os.path.getsize(full_path),
+                            'mime_type': mime_type or 'application/octet-stream',
+                            'path': relative_path,
+                            'scope': 'private'
+                        })
+            except Exception:
+                pass
+
+        scan_directory(target_path, path)
+
+        return {
+            'success': True,
+            'files': all_items,
+            'count': len(all_items),
+            'scope': 'private',
+            'recursive': True
+        }
+
+    # ========== 文件移动 ==========
+
+    def move_file(self, session_id: str, filename: str, target_path: str = '') -> Dict[str, Any]:
+        """移动工作区中的文件或文件夹到指定目录。
+
+        Args:
+            session_id: 会话ID
+            filename: 要移动的文件或文件夹路径
+            target_path: 目标目录路径（相对于工作区根目录）
+        """
+        ws_path = self.get_workspace(session_id)
+        if not ws_path:
+            return {'success': False, 'error': '工作区不存在'}
+
+        src_path = _resolve_within(ws_path, filename)
+        if not src_path:
+            return {'success': False, 'error': '路径不合法'}
+
+        if not os.path.exists(src_path):
+            return {'success': False, 'error': f'文件不存在: {filename}'}
+
+        # 构建目标路径
+        if target_path:
+            dst_dir = _resolve_within(ws_path, target_path)
+            if not dst_dir:
+                return {'success': False, 'error': '目标路径不合法'}
+        else:
+            dst_dir = ws_path
+
+        if not os.path.exists(dst_dir) or not os.path.isdir(dst_dir):
+            return {'success': False, 'error': '目标目录不存在'}
+
+        # 检查是否移动到自身目录下
+        dst_path = os.path.join(dst_dir, os.path.basename(filename))
+        if dst_path.startswith(src_path + os.sep) or dst_path == src_path:
+            return {'success': False, 'error': '不能将文件夹移动到自身目录下'}
+
+        try:
+            shutil.move(src_path, dst_path)
+            new_path = os.path.join(target_path, os.path.basename(filename)) if target_path else os.path.basename(filename)
+            return {'success': True, 'new_path': new_path.replace('\\', '/')}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    # ========== 获取文件路径 ==========
+
+    def get_file_path(self, session_id: str, filename: str) -> Optional[str]:
+        """获取工作区中文件的绝对路径（用于发送文件给用户）。
+
+        Returns:
+            文件绝对路径，不存在则返回 None
+        """
+        ws_path = self.get_workspace(session_id)
+        if not ws_path:
+            return None
+
+        file_path = _resolve_within(ws_path, filename)
+        if not file_path:
+            return None
+
+        if os.path.exists(file_path):
+            return file_path
+        ref = self.get_file_reference(session_id, filename)
+        if ref:
+            return ref.get("source_path")
+        return None
