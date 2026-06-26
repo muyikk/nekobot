@@ -1,23 +1,18 @@
-"""工具模块 - 提供 AI 可调用的各种工具
-
-向后兼容 shim：从 nbot.services.ai.tools 重新导出所有公共符号。
-"""
-from nbot.services.ai.tools import (
-    ToolExecutor,
-    execute_tool,
-    get_all_tool_definitions,
-    get_enabled_tools,
-    load_tools_config,
+"""AI 工具子包 - 重新导出公共符号."""
+from .definitions import TOOL_DEFINITIONS, WORKSPACE_TOOL_DEFINITIONS
+from .builtins import ToolExecutor
+from .executor import execute_tool, get_all_tool_definitions, get_enabled_tools, load_tools_config
+from .pending_exec import (
     store_pending_execution,
     execute_pending_command,
     reject_pending_command,
     get_pending_by_session,
     get_pending_info,
-    TOOL_DEFINITIONS,
-    WORKSPACE_TOOL_DEFINITIONS,
 )
 
 __all__ = [
+    "TOOL_DEFINITIONS",
+    "WORKSPACE_TOOL_DEFINITIONS",
     "ToolExecutor",
     "execute_tool",
     "get_all_tool_definitions",
@@ -28,6 +23,4 @@ __all__ = [
     "reject_pending_command",
     "get_pending_by_session",
     "get_pending_info",
-    "TOOL_DEFINITIONS",
-    "WORKSPACE_TOOL_DEFINITIONS",
 ]
