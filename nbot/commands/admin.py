@@ -4,9 +4,18 @@ from nbot.commands.registry import register_command
 from nbot.commands.shared.data_persistence import write_admin
 from nbot.utils.message_sender import send_text
 from nbot.commands.state import admin
-from nbot.web.utils.config_loader import load_config
+from nbot.config import get_config
 
-bot_id, admin_id = load_config()
+
+_ADMIN_ID: str | None = None
+
+
+def _get_admin_id() -> str:
+    """Return the configured root admin ID, loading it lazily."""
+    global _ADMIN_ID
+    if _ADMIN_ID is None:
+        _ADMIN_ID = get_config().get("ROOT", "").strip()
+    return _ADMIN_ID
 
 
 @register_command("/set_admin", "/sa", help_text="/set_admin <qq号> 或者 /sa <qq号> -> 设置管理员(root)", category="4", admin_show=True)
@@ -14,7 +23,7 @@ async def handle_set_admin(msg, is_group=True):
     if is_group:
         await msg.reply(text="只能私聊设置喵~")
         return
-    if str(msg.user_id) != str(admin_id):
+    if str(msg.user_id) != _get_admin_id():
         await bot.api.post_private_msg(msg.user_id, text="你没有权限设置管理员喵~")
         return
 
@@ -37,7 +46,7 @@ async def handle_del_admin(msg, is_group=True):
     if is_group:
         await msg.reply(text="只能私聊设置喵~")
         return
-    if str(msg.user_id) != str(admin_id):
+    if str(msg.user_id) != _get_admin_id():
         await bot.api.post_private_msg(msg.user_id, text="你没有权限删除管理员喵~")
         return
 

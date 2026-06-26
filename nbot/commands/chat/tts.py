@@ -2,7 +2,7 @@
 from nbot.commands import switch
 from nbot.commands.registry import register_command
 from nbot.utils.message_sender import send_text
-from nbot.commands.state import admin, if_tts
+from nbot.commands.state import admin
 
 
 @register_command("/tts", help_text="/tts -> 开启或关闭TTS(admin)", admin_show=True, category="4")
