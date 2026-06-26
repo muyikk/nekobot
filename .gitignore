@@ -1,14 +1,74 @@
-**/__pycache__/
-cache
-logs
-saved_message
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+.venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.ruff_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 测试
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# 运行时 / 用户特定配置
 .env
+config.ini
 admin.txt
 switches.json
-.DS_Store
-data
-resources
-**/tmp/
-nbot/plugins/bilibili
+smtp_config.json
+email_config.json
+wenku8_cookie.txt
+mc.txt
+*.pid
+*.log
+
+# 数据目录
+cache/
+logs/
+tmp/
+saved_message/
+data/
+downloads/
+resources/
 !resources/prompts/
-config.ini
+
+# Web 上传
+nbot/web/static/uploads/
+!nbot/web/static/uploads/.gitkeep
+
+# 插件下载
+nbot/plugins/bilibili
