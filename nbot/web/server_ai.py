@@ -216,8 +216,8 @@ class AIMixin:
         try:
             from nbot.web.secure_store import read_secure_json, write_secure_json
 
-            models_file = __import__("os").path.join(self.data_dir, "ai_models.json")
-            if __import__("os").path.exists(models_file):
+            models_file = os.path.join(self.data_dir, "ai_models.json")
+            if os.path.exists(models_file):
                 data, was_plaintext = read_secure_json(models_file, self.data_dir, {})
                 if was_plaintext:
                     write_secure_json(models_file, self.data_dir, data)

@@ -18,6 +18,7 @@ from flask import Flask
 from flask_socketio import SocketIO
 
 from nbot.utils.logger import get_logger
+from nbot.config import get_config
 from nbot.web.ai_service import (
     get_ai_response,
     get_ai_response_with_images,
@@ -381,16 +382,11 @@ class WebChatServer(
         self._start_background_initialization()
 
     def _load_web_config(self):
-        """从配置文件加载 Web 配置。"""
+        """从 .env 加载 Web 密码配置。"""
         try:
-            import configparser
-            config = configparser.ConfigParser()
-            config.read("config.ini", encoding="utf-8")
+            cfg = get_config()
+            self.web_password = cfg.get("WEB__PASSWORD", "").strip() or None
 
-            self.web_password = (
-                os.getenv("WEB_PASSWORD")
-                or config.get("web", "password", fallback=None)
-            )
             if self.web_password:
                 if self.web_password.startswith(("$2b$", "$2a$")):
                     self._web_password_is_hash = True
