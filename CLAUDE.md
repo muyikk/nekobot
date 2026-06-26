@@ -16,7 +16,7 @@ QQ + Telegram + Feishu + Web + CLI 五通道 AI 聊天机器人。基于 [NapCat
 
 | 文件 | 作用 |
 |------|------|
-| `bot.py` | 启动入口：加载 .env → 初始化 Web 服务器 → 启动 NCatBot → 注册插件 → 阻塞运行 |
+| `bot.py` | 启动入口：加载 .env → 应用 sandbox bridge → 初始化 Web 服务器 → 启动 NCatBot → 注册插件 → 阻塞运行。支持 `--cli` / `--no-web` / `--only-web` / `--cli-and-web` 多种模式 |
 | `.env` | `BOT_UIN`、`WS_URI=ws://127.0.0.1:30051`、`TOKEN=napcat_token` |
 | `config.ini` | Web 服务器配置（host/port/debug 等） |
 | `switches.json` | SwitchManager 持久化的功能开关（TTS/jm_send/auto_reply 等） |
@@ -30,109 +30,326 @@ QQ + Telegram + Feishu + Web + CLI 五通道 AI 聊天机器人。基于 [NapCat
 
 ```
 nekobot/
-├── bot.py                  # 入口
-├── nbot/                   # 主源码（99 个 .py 文件）
-│   ├── commands.py          # QQ 命令注册 + BotAPI 包装层（沙盒桥接）
-│   ├── ai_commands.py       # AI 增强命令
-│   ├── services/            # AI、聊天、TTS、技能工具库
-│   ├── core/                # AI 引擎核心（prompt、RAG、消息历史、工具循环）
-│   ├── character/           # 角色扮演引擎（档案、情感状态机）
-│   ├── channels/            # QQ/Telegram/Feishu/Web 频道适配
-│   ├── web/                 # Flask Web 管理面板（28 路由模块）
-│   ├── plugins/             # 技能系统 + 抖音/B站解析器 + 小说命令
-│   ├── cli/                 # Rich TUI 交互终端
-│   ├── chat.py / config.py / heartbeat.py  # 兼容 shim（指向新位置）
-├── resources/               # 静态资源
+├── bot.py                      # 入口
+├── nbot/                       # 主源码（267 个 .py 文件，~52k 行）
+│   ├── config.py                # Config 单例（.env 加载器）
+│   ├── chat.py                  # 🔗 兼容 shim → nbot/services/chat_service.py
+│   ├── heartbeat.py             # 🔗 兼容 shim → nbot/core/heartbeat.py
+│   ├── ai_commands.py           # 🔗 兼容 shim → nbot/commands/ai/
+│   ├── cli_simple.py            # 🔗 兼容 shim → nbot/cli/simple_app.py
+│   ├── cli_cc_style.py          # 🔗 兼容 shim → nbot/cli/cc_app.py
+│   ├── commands.py              # 🔗 兼容 shim（命令注册仍在此，逐步迁移中）
+│   ├── commands/                # 命令系统（按业务域拆分）
+│   │   ├── registry.py          # register_command 装饰器
+│   │   ├── state.py             # 共享状态（command_handlers, admin, favorites...）
+│   │   ├── dispatch/            # 消息分发（群/私聊路由、@bot 检测、文件保存）
+│   │   ├── ai/                  # AI 增强命令（原 ai_commands.py）
+│   │   ├── chat/                # 聊天命令（tts/remind/fortune/translate/del_message/task）
+│   │   ├── jmcomic/             # 禁漫下载/搜索/排行/收藏/黑名单
+│   │   ├── novel/               # 轻小说搜索（4000+ 条目）
+│   │   ├── mc/                  # Minecraft 服务器状态
+│   │   ├── media/               # 图片/视频/音乐/dice_rps
+│   │   ├── shared/              # 共享工具（数据持久化/chatter/scheduler/file_sender/email）
+│   │   ├── admin.py             # 管理命令
+│   │   ├── at_all.py            # @全体成员
+│   │   ├── bot_api.py           # BotAPI 包装层（sandbox bridge + 消息记录）
+│   │   ├── system.py            # /restart /shutdown
+│   │   ├── workspace_cmds.py    # 工作区命令
+│   │   └── other.py             # 杂项命令
+│   ├── core/                    # AI 引擎核心
+│   │   ├── pipeline/            # AI 处理管道（pipeline/phases/callbacks/tools/attachments）
+│   │   ├── workspace/           # 工作区文件管理（manager/file_ops/upload/references/shared_ops）
+│   │   ├── memory/              # 记忆管理
+│   │   ├── knowledge/           # 知识库
+│   │   ├── ai_pipeline.py       # 🔗 兼容 shim → core/pipeline/
+│   │   ├── message_middleware.py # 通用消息预处理（附件解析→媒体描述→注入 content）
+│   │   ├── agent_service.py     # Agent 服务
+│   │   ├── auto_memory.py       # 自动记忆
+│   │   ├── chat_models.py       # 聊天数据模型
+│   │   ├── file_parser.py       # 文件解析
+│   │   ├── model_adapter.py     # LLM 模型适配器
+│   │   ├── progress_card.py     # 进度卡片
+│   │   ├── prompt.py            # Prompt 构造
+│   │   ├── prompt_format.py     # Prompt 格式化工具
+│   │   ├── session_store.py     # 会话存储
+│   │   ├── skills_manager.py    # 技能管理器
+│   │   ├── todo_card.py         # TODO 卡片
+│   │   ├── token_stats.py       # Token 统计
+│   │   └── workflow.py          # 工作流引擎
+│   ├── services/                # 服务层
+│   │   ├── ai/tools/            # AI 工具定义与执行（builtins/definitions/exec_tools/executor/memory/misc/news/web/workspace）
+│   │   ├── ai.py                # AI 客户端适配层（通义千问 / OpenAI 兼容 API）
+│   │   ├── anthropic_adapter.py # Anthropic 适配器
+│   │   ├── chat_service.py      # 聊天编排：消息路由、会话管理
+│   │   ├── dynamic_executor.py  # 动态执行器
+│   │   ├── feishu_service.py    # 飞书 Bot 服务
+│   │   ├── feishu_ws_service.py # 飞书 WebSocket 服务
+│   │   ├── feishu_chat_service.py # 飞书聊天服务
+│   │   ├── telegram_service.py  # Telegram 服务
+│   │   ├── react.py             # ReAct 循环
+│   │   ├── skills_tools.py      # 技能工具定义
+│   │   ├── todo_tools.py        # TODO 工具
+│   │   ├── tool_registry.py     # 工具注册表
+│   │   ├── tools.py             # 工具聚合导出
+│   │   ├── tts.py               # 文本转语音
+│   │   └── stt.py               # 语音转文本
+│   ├── character/               # 角色扮演引擎
+│   │   ├── models.py            # 数据模型
+│   │   ├── runtime.py           # 运行时
+│   │   ├── compiler.py          # 编译器
+│   │   ├── planner.py           # 规划器
+│   │   ├── prompt_builder.py    # Prompt 构建器
+│   │   ├── prompt_stack.py      # Prompt 栈
+│   │   ├── state_machine.py     # 情感状态机
+│   │   ├── policies.py          # 策略
+│   │   ├── events.py            # 事件系统
+│   │   ├── memory.py            # 角色记忆
+│   │   ├── repository.py        # 角色仓库
+│   │   ├── adapters/            # 适配器（nekobot）
+│   │   └── storage/             # 存储后端（json_store）
+│   ├── channels/                # 多频道适配
+│   │   ├── base.py              # 基类/接口定义
+│   │   ├── qq.py                # QQ 频道适配器
+│   │   ├── telegram.py          # Telegram 适配器
+│   │   ├── feishu.py            # 飞书适配器
+│   │   ├── web.py               # Web 频道适配器
+│   │   ├── configured.py        # 已配置频道
+│   │   └── registry.py          # 频道注册表
+│   ├── web/                     # Web 管理面板（Flask + SocketIO）
+│   │   ├── server.py            # Web 服务器核心
+│   │   ├── socket_events.py     # SocketIO 事件处理
+│   │   ├── ai_service.py        # Web AI 服务
+│   │   ├── message_adapter.py   # 消息适配器
+│   │   ├── persistence.py       # 持久化
+│   │   ├── sessions_db.py       # 会话数据库（SQLite）
+│   │   ├── secure_store.py      # 安全存储（Fernet 加密）
+│   │   ├── push_keys.py         # Push 密钥
+│   │   ├── agent_tools.py       # Agent 工具
+│   │   ├── ai/                  # AI 子模块（service/models/tools/callbacks/images/progress/trigger）
+│   │   ├── routes/              # 路由模块（28 个）
+│   │   │   ├── chat/            # 会话路由（sessions/archive/import_export/utils）
+│   │   │   ├── persona/         # 角色路由（personality/compile/crud/io/ai/platform）
+│   │   │   ├── auth.py          # 认证
+│   │   │   ├── ai_config.py     # AI 配置
+│   │   │   ├── ai_models.py     # AI 模型管理
+│   │   │   ├── channels.py      # 频道管理
+│   │   │   ├── characters.py    # 角色管理
+│   │   │   ├── files.py         # 文件管理
+│   │   │   ├── heartbeat.py     # 心跳
+│   │   │   ├── knowledge.py     # 知识库
+│   │   │   ├── live2d.py        # Live2D 虚拟形象
+│   │   │   ├── memory.py        # 记忆
+│   │   │   ├── push.py          # Push 通知
+│   │   │   ├── qrcode.py        # 二维码
+│   │   │   ├── skills.py        # 技能
+│   │   │   ├── voice.py         # 语音
+│   │   │   ├── web_agent.py     # Web Agent
+│   │   │   ├── workflows.py     # 工作流
+│   │   │   └── workspace_*.py   # 工作区（misc/private/shared）
+│   │   ├── utils/               # 工具（config_loader）
+│   │   ├── static/              # 静态资源（CSS/JS/Live2D/vendor/uploads）
+│   │   └── templates/           # Jinja2 模板
+│   ├── plugins/                 # 插件系统
+│   │   ├── manager.py           # 插件管理器
+│   │   ├── dispatcher.py        # Skill 调度器（解析 AI 回复中的 [SKILL:xxx] 调用）
+│   │   ├── bilibili_parser.py   # B 站视频解析
+│   │   ├── douyin_parser.py     # 抖音视频解析
+│   │   └── skills/              # 技能系统
+│   │       ├── base.py          # SkillContext / SkillRegistry
+│   │       ├── loader.py        # 技能加载器
+│   │       ├── dynamic_skill.py # 动态技能
+│   │       └── builtin/         # 内置技能（download/search）
+│   ├── cli/                     # Rich TUI 交互终端
+│   │   ├── app.py               # CLI 应用入口
+│   │   ├── simple_app.py        # Simple 模式 App
+│   │   ├── simple_handlers.py   # Simple 模式命令处理器
+│   │   ├── simple_ai.py         # Simple 模式 AI
+│   │   ├── cc_app.py            # CC Style App
+│   │   ├── cc_ai.py             # CC Style AI
+│   │   ├── cc_commands.py       # CC Style 命令
+│   │   ├── cc_display.py        # CC Style 显示
+│   │   ├── cc_personality.py    # CC Style 角色
+│   │   ├── cc_utils.py          # CC Style 工具
+│   │   ├── cc_workspace.py      # CC Style 工作区
+│   │   ├── completer.py         # 自动补全
+│   │   ├── markdown.py          # Markdown 渲染
+│   │   ├── styles.py            # 样式定义
+│   │   ├── components/          # UI 组件（layout/panels/input）
+│   │   └── screens/             # 界面（main/chat/tools/sessions/config/base）
+│   └── utils/                   # 通用工具
+│       ├── base64_image.py      # Base64 图片处理
+│       ├── http_client.py       # HTTP 客户端
+│       ├── logger.py            # 日志配置
+│       ├── message_sender.py    # 消息发送器
+│       ├── paths.py             # 路径工具
+│       └── sandbox_bridge.py    # macOS QQ 沙盒桥接
+├── resources/                   # 静态资源
 │   └── config/
-│       ├── option.yml       # jmcomic 下载器配置
-│       ├── urls.ini         # 随机图片/视频/表情 API URL
-│       ├── emoji_map.json   # QQ 表情映射
+│       ├── option.yml           # jmcomic 下载器配置
+│       ├── urls.ini             # 随机图片/视频/表情 API URL
+│       ├── emoji_map.json       # QQ 表情映射
 │       └── novel_details2.json  # 4000+ 轻小说元数据
-├── tools/                   # 测试脚本
-│   └── test_jm_upload.py    # sandbox bridge 测试（12 个用例）
-├── cache/                   # 漫画/搜索/封面缓存（运行时生成）
-├── data/                    # 工作区数据
-├── tmp/                     # 临时下载目录
-└── logs/                    # 日志文件
+├── tools/                       # 辅助脚本
+│   ├── test_jm_upload.py        # sandbox bridge 测试
+│   ├── test_commands.py         # 命令测试
+│   ├── update_novel.py          # 小说数据更新
+│   └── sort_novels_by_res.py    # 小说排序
+├── tests/                       # 单元测试
+│   ├── test_config.py           # Config 测试
+│   └── utils/                   # 工具测试（http_client/base64_image/paths/message_sender/logger/sandbox_bridge）
+├── cache/                       # 漫画/搜索/封面缓存（运行时生成）
+├── data/                        # 工作区数据
+│   └── workspaces/              # 工作区文件（_shared + 各会话目录）
+├── tmp/                         # 临时下载目录
+├── logs/                        # 日志文件
+├── docs/                        # 文档
+└── saved_message/               # 保存的消息
 ```
 
 ---
 
-## 核心模块
+## 核心模块详解
 
-### `nbot/commands.py` — 主命令处理器（~4700 行）
+### `nbot/commands/` — 命令系统（已从单文件拆分为子包）
 
-- **注册命令**：`@register_command("/cmd", help_text="...", category="1-4")` 装饰器
-- **BotAPI 包装层**：模块加载时自动应用 3 层 monkey-patch：
-  1. `_nbot_patched`：记录机器人发出的所有消息到历史（`post_private_msg` / `post_group_msg`）
-  2. `_nbot_sandbox_wrapped`：自动把本地文件 hard link 到 QQ 沙盒（`post_group_file` / `post_private_file` / `upload_group_file` / `upload_private_file` 的 `file`/`image`/`video`/`record`/`markdown` kwarg）——解决 macOS QQ App Sandbox EPERM 问题
-- **SwitchManager**：持久化功能开关（json 文件），支持群/用户级别
-- **关键函数**：`load_address()` 返回 `cache/` 绝对路径，所有子目录（pdf/rank/search/fav/jm_cover_cache）建在它下面
+原 `commands.py`（~4700 行）已按业务域拆分为子包，但 `nbot/commands.py` 仍保留为兼容 shim。
 
-### `nbot/services/` — 服务层
+**子包结构：**
 
-| 文件 | 作用 |
+| 子包 | 内容 |
 |------|------|
-| `ai.py` | AI 客户端适配层（通义千问 / OpenAI 兼容 API） |
-| `chat_service.py` | 聊天编排：用户/群消息路由、会话管理、每日总结、ReAct 循环 |
-| `skills_tools.py` | 94KB 技能工具库——结构化工具定义与注册 |
-| `tts.py` | 文本转语音（TTS） |
-| `stt.py` | 语音转文本（STT） |
+| `registry.py` | `register_command` 装饰器 + `get_all_help_text_for_prompt`，命令分为 8 个 category |
+| `state.py` | 共享可变状态（`command_handlers`, `admin`, `black_list_comic`, `running`, `tasks`, `user_favorites`, `group_favorites`, `comic_cache`, `api_book`, `schedule_tasks`, `smtp_config`, `at_all_group`, `books`, `if_tts`） |
+| `dispatch/` | `dispatch_message` → `handle_group_message` / `handle_private_message`，`is_at_bot` 检测，文件自动保存到 workspace |
+| `ai/` | AI 增强命令（原 `ai_commands.py`）—— `handlers_chat.py`, `handlers_admin.py`, `handlers_admin_helpers.py`, `registry.py`, `utils.py` |
+| `chat/` | 聊天命令：`tts.py`, `remind.py`, `fortune.py`, `translate.py`, `del_message.py`, `task.py` |
+| `jmcomic/` | 禁漫命令：`download.py`, `search.py`, `rank.py`, `favorites.py`, `blacklist.py`, `html_builder.py`, `settings.py` |
+| `novel/` | 轻小说：`search.py`, `info.py`, `hot.py`, `html_builder.py`, `wenku8_api.py` |
+| `mc/` | Minecraft 服务器状态 |
+| `media/` | `image.py`, `video.py`, `music.py`, `dice_rps.py` |
+| `shared/` | 跨模块共享：`data_persistence.py`（load/save 系列）、`chatter.py`（chat_loop）、`scheduler.py`、`file_sender.py`、`message_patches.py`、`email.py` |
+
+**包入口 `__init__.py`** 统一 re-export 所有公共 API，子模块只需 `from nbot.commands import ...` 即可。
 
 ### `nbot/core/` — AI 引擎核心
 
-| 文件 | 作用 |
+| 文件/子包 | 作用 |
 |------|------|
-| `heartbeat.py` | 心跳保持（WebSocket 保活） |
-| `prompt.py` | Prompt 构造 |
-| `rag.py` | 检索增强生成 |
-| `message_history.py` | 消息历史管理 |
-| `tool_loop.py` | 工具调用循环（让 LLM 自主使用工具） |
-| `workspace.py` | 工作区文件管理 |
-| `token_tracker.py` | Token 计数追踪 |
+| `pipeline/` | AI 处理管道——`AIPipeline`（编排）→ `PipelineContext` → phases（prep/chat/tool_loop）→ callbacks |
+| `workspace/` | 工作区——`WorkspaceManager`（核心）→ `file_ops.py`（CRUD）、`upload.py`（上传）、`references.py`（引用）、`shared_ops.py`（共享操作）、`utils.py`（工具） |
+| `memory/` | 记忆管理 |
+| `knowledge/` | 知识库 |
+| `message_middleware.py` | 通用消息预处理：AttachmentResolver → MediaDescriber → MessagePreprocessor，统一附件格式 `{type, url, source, source_ref, mime_type, name}` |
+| `agent_service.py` | Agent 服务 |
+| `auto_memory.py` | 自动记忆 |
+| `chat_models.py` | 聊天数据模型 |
 | `file_parser.py` | 文件解析 |
-| `knowledge/` | 知识库子模块 |
+| `message.py` | 消息模型 |
+| `model_adapter.py` | LLM 模型适配器 |
+| `progress_card.py` | 进度卡片（TUI） |
+| `prompt.py` | Prompt 构造 |
+| `prompt_format.py` | Prompt 格式化 |
+| `session_store.py` | 会话持久化存储 |
+| `skills_manager.py` | 技能管理器 |
+| `todo_card.py` | TODO 卡片（TUI） |
+| `token_stats.py` | Token 统计 |
+| `workflow.py` | 工作流引擎 |
+
+### `nbot/services/` — 服务层
+
+| 文件/子包 | 作用 |
+|------|------|
+| `ai.py` | AI 客户端适配层（通义千问 / OpenAI 兼容 API） |
+| `anthropic_adapter.py` | Anthropic API 适配器 |
+| `chat_service.py` | 聊天编排：用户/群消息路由、会话管理 |
+| `react.py` | ReAct 循环（让 LLM 自主使用工具） |
+| `ai/tools/` | AI 工具系统——`definitions.py`（定义）、`executor.py`（执行）、`builtins.py`/`memory_tools.py`/`web_tools.py`/`workspace_tools.py`/`news_tools.py`/`misc_tools.py`（各类工具实现） |
+| `skills_tools.py` | 技能工具定义与注册 |
+| `tool_registry.py` | 工具注册表 |
+| `dynamic_executor.py` | 动态代码执行器 |
+| `todo_tools.py` | TODO 工具 |
+| `tts.py` / `stt.py` | 文本转语音 / 语音转文本 |
+| `telegram_service.py` | Telegram Bot 服务 |
+| `feishu_service.py` / `feishu_chat_service.py` / `feishu_ws_service.py` | 飞书三件套 |
 
 ### `nbot/character/` — 角色扮演引擎
 
 独立运行的拟人层——角色档案 → 情感状态机 → 信号分析 → 反应规划 → 行为输出，与 AI 对话流并行。
 
+| 文件 | 作用 |
+|------|------|
+| `models.py` | 角色/档案数据模型 |
+| `runtime.py` | 运行时核心 |
+| `compiler.py` | 角色编译器 |
+| `planner.py` | 行为规划器 |
+| `prompt_builder.py` | Prompt 构建器 |
+| `prompt_stack.py` | Prompt 栈管理 |
+| `state_machine.py` | 情感状态机 |
+| `policies.py` | 行为策略 |
+| `events.py` | 事件系统 |
+| `memory.py` | 角色记忆 |
+| `repository.py` | 角色持久化仓库 |
+| `adapters/nekobot.py` | NekoBot 适配器 |
+| `storage/json_store.py` | JSON 存储后端 |
+
 ### `nbot/channels/` — 多频道适配
 
 | 文件 | 作用 |
 |------|------|
+| `base.py` | 基类/接口定义 |
 | `qq.py` | QQ 频道适配器 |
 | `telegram.py` | Telegram 适配器 |
 | `feishu.py` | 飞书适配器 |
 | `web.py` | Web 频道适配器 |
-| `base.py` | 基类 / 接口定义 |
+| `configured.py` | 已配置频道管理 |
+| `registry.py` | 频道注册表 |
 
-### `nbot/web/` — Web 管理面板（Flask + SocketIO）
+### `nbot/web/` — Web 管理面板
 
-33 个文件，28 个路由模块。功能包括：
-- 实时聊天界面（WebSocket）
-- Live2D 虚拟形象
-- 会话管理（SQLite 持久化）
-- 安全存储（Fernet 加密）
-- PWA 支持
-- 角色配置管理
+Flask + SocketIO 架构，**session 持久化在 SQLite**（`sessions_db.py`），**敏感数据用 Fernet 加密**（`secure_store.py`）。
+
+| 文件/子包 | 作用 |
+|------|------|
+| `server.py` | Flask app 工厂 + SocketIO 初始化 |
+| `socket_events.py` | SocketIO 事件处理（实时聊天） |
+| `ai_service.py` | Web AI 服务 |
+| `ai/` | AI 子模块——`service.py`（核心服务）、`models.py`（模型）、`tools.py`（工具）、`callbacks.py`（回调）、`images.py`（图片）、`progress.py`（进度）、`trigger.py`（触发器） |
+| `routes/` | 28 个路由模块 |
+| `routes/chat/` | 会话管理：`sessions.py`（核心）、`sessions_archive.py`（归档）、`sessions_import_export.py`（导入导出）、`sessions_utils.py`（工具） |
+| `routes/persona/` | 角色管理：`personality.py`（核心）、`personality_crud.py`（CRUD）、`personality_ai.py`（AI）、`personality_io.py`（导入导出）、`compile.py`（编译）、`platform.py`（平台） |
+| `routes/` 其他 | `auth.py`, `ai_config.py`, `ai_models.py`, `api_keys.py`, `channels.py`, `characters.py`, `config_legacy.py`, `files.py`, `heartbeat.py`, `knowledge.py`, `live2d.py`, `memory.py`, `public_sessions.py`, `push.py`, `qq_overview.py`, `qrcode.py`, `skills.py`, `skills_storage.py`, `task_center.py`, `tools.py`, `voice.py`, `web_agent.py`, `workflows.py`, `workspace_*.py` |
 
 ### `nbot/plugins/` — 插件系统
 
 | 文件 | 作用 |
 |------|------|
-| `bilibili_parser.py` | B 站视频解析：检测 B 站链接 → 封面图(base64) + 文字信息 → 下载视频 → sandbox bridge 发送 |
-| `douyin_parser.py` | 抖音视频解析：同 B 站模式 |
-| `skills/` | 技能系统（builtin 占位 + external + web 配置型动态技能） |
-| `novel_commands.py` | 轻小说检索命令（基于 `novel_details2.json` 的 4000+ 条目） |
-
-### `nbot/ai_commands.py` — AI 增强命令
-
-12+ 额外 slash 命令，包括 /.summary（每日总结）、/.clear（清除会话）等。
+| `manager.py` | 插件管理器（加载/卸载/执行） |
+| `dispatcher.py` | Skill 调度器——解析 AI 回复中的 `[SKILL:name]params[/SKILL]` 标签，执行并替换结果 |
+| `bilibili_parser.py` | B 站视频解析：检测链接 → 封面图(base64) + 文字 → 下载视频 → sandbox bridge |
+| `douyin_parser.py` | 抖音视频解析（同上模式） |
+| `skills/` | 技能系统——`base.py`（SkillContext/SkillRegistry）、`loader.py`（加载器）、`dynamic_skill.py`（动态技能）、`builtin/`（download/search） |
 
 ### `nbot/cli/` — TUI 终端
 
-基于 Rich 库的交互式终端界面：`CLIApp` → Screen 类（Main/Chat/Tools/Sessions/Config）→ Component 类（Header/Footer/Sidebar/InputBox）。
+基于 Rich 库的交互式终端。两种模式：
+- **CC Style** (`cc_app.py`)：仿 Claude Code 风格的全功能终端
+- **Simple** (`simple_app.py`)：简化终端
+
+| 子包 | 内容 |
+|------|------|
+| `components/` | UI 组件——`layout.py`（布局）、`panels.py`（面板）、`input.py`（输入框） |
+| `screens/` | 界面——`main.py`（主界面）、`chat.py`（聊天）、`tools.py`（工具）、`sessions.py`（会话）、`config.py`（配置）、`base.py`（基类） |
+
+### `nbot/utils/` — 通用工具
+
+| 文件 | 作用 |
+|------|------|
+| `sandbox_bridge.py` | macOS QQ 沙盒桥接——自动 `os.link()` hard link 文件到沙盒内 |
+| `message_sender.py` | 消息发送器（兼容多频道） |
+| `base64_image.py` | Base64 图片编解码 |
+| `http_client.py` | HTTP 客户端封装 |
+| `logger.py` | 日志配置 |
+| `paths.py` | 路径工具 |
 
 ---
 
@@ -141,16 +358,22 @@ nekobot/
 ### 1. 命令注册
 
 ```python
+from nbot.commands import register_command
+
 @register_command("/jm", help_text="/jm <漫画ID> -> 下载漫画", category="1")
 async def handle_jmcomic(msg, is_group=True):
     ...
 ```
 
-命令处理器存储在全局 `command_handlers` dict，由 `dispatch_message` 统一分发。
+命令处理器存储在 `nbot.commands.state.command_handlers` dict，由 `nbot.commands.dispatch.dispatch_message` 统一分发。
+
+**迁移到子包时**，命令 handler 定义在 `nbot/commands/jmcomic/download.py` 等子模块，通过 `nbot/commands.py`（兼容 shim）导入注册。
 
 ### 2. macOS QQ Sandbox 桥接
 
-macOS 把 QQ Helper 限制在 `~/Library/Containers/com.tencent.qq/` 容器内。任何容器外文件 `fs.open()` 都返回 EPERM。解决方案：在 BotAPI 类级别用 `_wrap_botapi_upload` 包装 4 个上传方法，自动 `os.link()` hard link 到沙盒内。**所有文件上传调用点自动受益，无需逐处修改。**
+macOS 把 QQ Helper 限制在 `~/Library/Containers/com.tencent.qq/` 容器内。任何容器外文件 `fs.open()` 都返回 EPERM。
+
+桥接实现已从 `commands.py` 提取到 **`nbot/utils/sandbox_bridge.py`**。`bot.py` 在启动时调用 `apply_qq_sandbox_bridge()` 自动包装 BotAPI 的上传方法。**所有文件上传调用点自动受益，无需逐处修改。**
 
 桥接常量：`QQ_SANDBOX_DIR = ~/Library/Containers/com.tencent.qq/Data/Library/Application Support/QQ/nekobot_files/`
 
@@ -168,6 +391,19 @@ B 站/抖音视频的完整链路：
 - 检查 API 调用结果必须判断 `result.get("status") == "ok"`，不能只依赖 try/except
 - 用户可见的失败必须有明确反馈（不能只 log）
 
+### 5. 消息预处理管道
+
+`nbot/core/message_middleware.py` 为所有频道提供统一的附件处理：
+1. **AttachmentResolver** — 频道特定 → 可访问 URL / data URL
+2. **MediaDescriber** — 媒体类型 → AI 文字描述
+3. **MessagePreprocessor** — 编排，注入 content
+
+附件标准格式：`{type, url, source, source_ref, mime_type, name, ...}`
+
+### 6. Skill 调度
+
+AI 回复中可包含 `[SKILL:name]params[/SKILL]` 标签，`SkillDispatcher` 自动解析、执行并替换结果文本。Skill 定义在 `nbot/plugins/skills/`，通过 `PluginsManager` 加载。
+
 ---
 
 ## 缓存/临时文件路径
@@ -181,6 +417,7 @@ B 站/抖音视频的完整链路：
 | 定时聊天状态 | `cache/running/` |
 | B 站/抖音视频 | `tmp/bili_*.mp4`、`tmp/douyin_*.mp4` |
 | QQ Sandbox 桥接 | `~/Library/Containers/com.tencent.qq/Data/Library/Application Support/QQ/nekobot_files/` |
+| 工作区文件 | `data/workspaces/`（`_shared/` + 各会话子目录） |
 
 ---
 
@@ -198,16 +435,43 @@ B 站/抖音视频的完整链路：
 ## 常用工作流
 
 ### 新增命令
-1. 在 `nbot/commands.py` 用 `@register_command("/xxx", help_text="...", category="N")` 装饰 async 函数
-2. 函数签名：`async def handler(msg, is_group=True)`，`msg` 是 NCatBot 消息对象
-3. 用 `msg.raw_message` 取原始文本，`msg.reply(text=...)` 回复
-4. 需要发文件时直接用 `bot.api.post_group_file(video=path)` 等——sandbox bridge 自动生效
+1. 根据命令类型在 `nbot/commands/<domain>/` 下找到对应子模块（如禁漫 → `jmcomic/`，聊天 → `chat/`）
+2. 用 `@register_command("/xxx", help_text="...", category="N")` 装饰 async 函数
+3. 函数签名：`async def handler(msg, is_group=True)`，`msg` 是 NCatBot 消息对象
+4. 用 `msg.raw_message` 取原始文本，`msg.reply(text=...)` 回复
+5. 需要发文件时直接用 `bot.api.post_group_file(video=path)` 等——sandbox bridge 自动生效
+6. **仍需在 `nbot/commands.py`（兼容 shim）中 import 以确保注册**
 
 ### 调试
 - 日志在 `logs/bot_YYYY_MM_DD.log`
 - 关键 grep 关键词：`[Bili]`、`[Douyin]`、`[jm]`、`EPERM`、`Forbidden`、`qq-sandbox`
-- 测试：`python3 tools/test_jm_upload.py`（验证 sandbox bridge）
+- 测试：`python3 tools/test_jm_upload.py`（验证 sandbox bridge）| `python3 -m pytest tests/`
 
-### 重启机器人
+### 启动方式
+- `python3 bot.py` — 默认模式（QQ + Web 面板）
+- `python3 bot.py --cli` — CLI 终端模式
+- `python3 bot.py --only-web` — 仅 Web 面板
+- `python3 bot.py --no-web` — 仅 QQ 机器人
+- `python3 bot.py --cli-and-web` — CLI + Web 同时启动
 - 管理命令 `/restart`（`os.execv`）和 `/shutdown`（`sys.exit`）
 - 修改 `nbot/` 下任何 .py 后需要重启（无热重载）
+
+---
+
+## 架构速览
+
+```
+bot.py (入口)
+  ├─ apply_qq_sandbox_bridge()        # nbot/utils/sandbox_bridge.py
+  ├─ Config 单例                       # nbot/config.py
+  ├─ setup_logging()                  # nbot/utils/logger.py
+  ├─ run_bot() ────────────────────── # 加载 nbot/commands → NCatBot.run()
+  ├─ run_cli() ────────────────────── # nbot/cli/cc_app.py / simple_app.py
+  ├─ start_web_server() ───────────── # nbot/web/server.py → Flask + SocketIO
+  └─ run_cli_and_web()               # 多线程：Web + CLI
+
+命令流: 用户消息 → dispatch_message() → command_handlers → handler(msg)
+聊天流: 非命令消息 → chat_service → AI pipeline → tools loop → 回复
+插件流: AI 回复中的 [SKILL:] → SkillDispatcher → 执行 → 替换结果
+文件流: 本地文件 → sandbox_bridge hard link → QQ 沙盒 → NapCat 上传
+```
