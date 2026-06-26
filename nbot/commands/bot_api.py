@@ -16,11 +16,11 @@ def parse_command_string(cmd_str: str) -> dict:
         cmd_str: Raw command text.
 
     Returns:
-        Dict with ``func`` and ``params`` keys, or None on parse failure.
+        Dict with ``func`` and ``params`` keys, or ``None`` on parse failure.
     """
     func_match = re.match(r"^/([\w.]+)\((.*)\)$", cmd_str)
     if not func_match:
-        return {}
+        return None
 
     func_name = func_match.group(1)
     params_str = func_match.group(2)
