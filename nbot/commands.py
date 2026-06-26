@@ -22,681 +22,121 @@ import re
 import os
 import asyncio
 import time
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.base import MIMEBase
-from email import encoders
 from jmcomic import *
 from typing import Dict, List
 from datetime import datetime
 from PIL import Image as PILImage
 from ncatbot.core import (
-    MessageChain,  
-    Music,          
+    MessageChain,
+    Music,
 )
-#----------------------
-# region 全局变量设置
-#----------------------
 
-if_tts = False #判断是否开启TTS
+# Import infrastructure from the new commands package
+from nbot.commands.state import (
+    command_handlers,
+    admin,
+    black_list_comic,
+    running,
+    tasks,
+    user_favorites,
+    group_favorites,
+    comic_cache,
+    api_book,
+    schedule_tasks,
+    smtp_config,
+    user_email,
+    at_all_group,
+    books,
+    if_tts,
+)
+from nbot.commands.registry import register_command, get_all_help_text_for_prompt
+from nbot.commands.dispatch import (
+    dispatch_message,
+    handle_group_message,
+    handle_private_message,
+    is_at_bot,
+    _normalize_qq_id,
+    _get_value,
+    _bot_uin_candidates,
+    _iter_mention_ids,
+    _iter_message_segments,
+    _is_at_all_enabled,
+    _save_incoming_files_to_workspace,
+    _get_project_root,
+)
+from nbot.commands.shared.data_persistence import (
+    normalize_file_path,
+    read_at_all_group,
+    write_at_all_group,
+    write_admin,
+    load_admin,
+    load_address,
+    load_favorites,
+    load_smtp_config,
+    save_smtp_config,
+    load_email_config,
+    save_email_config,
+    save_favorites,
+    write_blak_list,
+    load_blak_list,
+    write_running,
+    normalize_timestamp,
+    load_running,
+    load_novel_data,
+)
+from nbot.commands.shared.scheduler import (
+    schedule_task,
+    schedule_task_by_date,
+    schedule_job_task,
+)
+from nbot.commands.shared.chatter import (
+    chatter,
+    chat_loop,
+    update_user_active_chat_time,
+    update_running,
+)
+from nbot.commands.shared.message_patches import apply_message_patches
+from nbot.commands.shared.file_sender import async_send_file, handle_generic_file
+from nbot.commands.shared.email import send_comic_email, _send_comic_email_sync
+from nbot.commands.help import handle_help
+from nbot.commands.bot_api import handle_api, parse_command_string
+from nbot.commands.at_all import handle_at_all_group
+
+#----------------------
+# region Global setup
+#----------------------
 
 _log = get_logger(__name__)
 
-def normalize_file_path(path: str) -> str:
-    """
-    标准化文件路径，将Windows反斜杠转换为正斜杠，
-    并使用绝对路径，确保ncatbot能正确识别
-    """
-    return os.path.abspath(path).replace("\\", "/")
-
-bot_id,admin_id = load_config() # 加载配置,返回机器人qq号
+bot_id, admin_id = load_config()  # 加载配置,返回机器人qq号
 
 bot = BotClient()
 heartbeat_core = HeartbeatCore(bot.api)
 
-# ----------------------
-# region 统一消息发送与记录
-# ----------------------
-# 记录机器人发送的所有消息到历史记录中
-# 通过直接补丁 BotAPI 和消息类，确保所有发送方式都能被记录
-
-# 防止重复应用补丁
-if not hasattr(BotAPI, '_nbot_patched'):
-    original_post_private_msg = BotAPI.post_private_msg
-    original_post_group_msg = BotAPI.post_group_msg
-    original_group_reply = GroupMessage.reply
-    original_private_reply = PrivateMessage.reply
-    pending_group_reply_context = {}
-
-    async def wrapped_post_private_msg(self, user_id, **kwargs):
-        content = kwargs.get('text', '')
-        if content and isinstance(content, str):
-            try:
-                from chat import record_assistant_message
-                record_assistant_message(content, user_id=user_id)
-            except Exception:
-                pass
-        return await original_post_private_msg(self, user_id, **kwargs)
-
-    async def wrapped_post_group_msg(self, group_id, **kwargs):
-        content = kwargs.get('text', '')
-        if content and isinstance(content, str):
-            try:
-                from chat import record_assistant_message, log_to_group_full_file
-                context_key = (str(group_id), content)
-                pending_users = pending_group_reply_context.get(context_key, [])
-                group_user_id = pending_users.pop(0) if pending_users else kwargs.get("group_user_id")
-                if pending_users:
-                    pending_group_reply_context[context_key] = pending_users
-                else:
-                    pending_group_reply_context.pop(context_key, None)
-                record_assistant_message(
-                    content,
-                    group_id=group_id,
-                    group_user_id=group_user_id,
-                )
-                log_to_group_full_file(group_id, bot_id, "机器人", content)
-            except Exception:
-                pass
-        return await original_post_group_msg(self, group_id, **kwargs)
-
-    async def wrapped_group_reply(self, text=None, **kwargs):
-        content = text if isinstance(text, str) else kwargs.get("text", "")
-        if content and isinstance(content, str):
-            context_key = (str(self.group_id), content)
-            pending_group_reply_context.setdefault(context_key, []).append(str(self.user_id))
-        return await original_group_reply(self, text=text, **kwargs)
-
-    # 应用补丁到类级别
-    BotAPI.post_private_msg = wrapped_post_private_msg
-    BotAPI.post_group_msg = wrapped_post_group_msg
-    GroupMessage.reply = wrapped_group_reply
-    BotAPI._nbot_patched = True
-# ----------------------
-
-command_handlers = {}
-
-user_favorites: Dict[str, List[str]] = {}  # 用户收藏夹 {user_id: [comic_ids]}
-group_favorites: Dict[str, Dict[str, List[str]]] = {}  # 群组收藏夹 {group_id: {user_id: [comic_ids]}}
-
-admin = [str(admin_id)]  # 确保admin_id是字符串形式
-
-black_list_comic = {"global": [], "groups": {}, "users": {}} # str,黑名单
-
-running = {}  #用于定时聊天的开关
-tasks = {}  # 用于存储聊天的定时任务
-
-books = {}
-
-smtp_config = {}
-user_email = {}
-
-schedule_tasks = {} #用于存储定时任务
-
-at_all_group = [] # 用于存储@全体成员的群
-
-# ------------------
-# region 通用函数
-# ------------------
-
-def read_at_all_group():
-    try:
-        with open(os.path.join(load_address(),"at_all_group.txt"), "r", encoding="utf-8") as f:
-            group_ids = f.readlines()
-            for i in range(len(group_ids)):
-                group_ids[i] = group_ids[i].strip()
-            at_all_group.extend(group_ids)
-    except FileNotFoundError:
-        write_at_all_group()
-
-def write_at_all_group():
-    with open(os.path.join(load_address(),"at_all_group.txt"), "w", encoding="utf-8") as f:
-        for group_id in at_all_group:
-            f.write(group_id + "\n")
-
-def write_admin():
-    try:
-        with open("admin.txt", "w", encoding="utf-8") as f:
-            f.write("\n".join(admin) + "\n")  # 每行一个管理员ID
-    except Exception as e:
-        _log.error(f"写入管理员文件失败: {e}")
-
-def load_admin():
-    try:
-        with open("admin.txt", "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and line != str(admin_id):
-                    admin.append(line)
-    except FileNotFoundError:
-        write_admin()
-
-def register_command(*command,help_text = None,admin_show = False,category = "1"): # 注册命令
-    """
-    装饰器，用于注册命令。
-    :param command: 命令名称，支持多个。
-    :param help_text: 命令的帮助文本。
-    :param admin_show: 是否在帮助中显示管理员命令，默认False。
-    :param category: 命令所属分类，默认"1"。
-    """
-    def decorator(func):
-        command_handlers[command] = func
-        func.help_text = help_text
-        func.admin_show = admin_show
-        func.category = category
-        return func
-    return decorator
-
-def load_address(): # 加载配置文件，返回图片保存地址（绝对路径）
-    """
-    加载配置文件，返回缓存目录的绝对路径
-    支持跨平台（Windows/Linux/Mac）
-    """
-    # 获取项目根目录（即包含 nbot 目录的目录）
-    # 使用当前文件所在位置来确定项目根目录
-    current_file_dir = os.path.dirname(os.path.abspath(__file__))
-    # 从 nbot/commands.py 回到项目根目录
-    project_root = os.path.dirname(current_file_dir)
-
-    config_path = os.path.join(project_root, "resources", "config", "option.yml")
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        conf = yaml.safe_load(f)
-        after_photo_list = conf.get("plugins", {}).get("after_album", [])
-        if after_photo_list and isinstance(after_photo_list, list):
-            pdf_dir = after_photo_list[0].get("kwargs", {}).get("pdf_dir", "./cache/pdf/")
-        else:
-            pdf_dir = "./cache/pdf/"
-
-    # 将相对路径转换为绝对路径
-    if not os.path.isabs(pdf_dir):
-        # 如果是相对路径，基于项目根目录解析
-        pdf_dir = os.path.join(project_root, pdf_dir)
-
-    pdf_dir = os.path.normpath(pdf_dir)
-    cache_dir = os.path.dirname(pdf_dir)  # 返回pdf目录的父目录
-
-    # 确保目录存在
-    os.makedirs(cache_dir, exist_ok=True)
-
-    return cache_dir
-
-def load_favorites():
-    """加载收藏夹数据"""
-    cache_dir = os.path.join(load_address(),"list")
-    os.makedirs(cache_dir, exist_ok=True)
-    
-    # 加载用户收藏
-    user_file = os.path.join(cache_dir, "user_favorites.json")
-    if os.path.exists(user_file):
-        with open(user_file, 'r', encoding='utf-8') as f:
-            user_favorites.update(json.load(f))
-    
-    # 加载群组收藏
-    group_file = os.path.join(cache_dir, "group_favorites.json")
-    if os.path.exists(group_file):
-        with open(group_file, 'r', encoding='utf-8') as f:
-            group_favorites.update(json.load(f))
-
-def load_smtp_config():
-    global smtp_config
-    try:
-        with open("smtp_config.json", "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, dict) and "host" in data:
-                smtp_config = {"global": data}
-            else:
-                smtp_config = data
-    except FileNotFoundError:
-        smtp_config = {}
-
-def save_smtp_config():
-    with open("smtp_config.json", "w", encoding="utf-8") as f:
-        json.dump(smtp_config, f, ensure_ascii=False, indent=2)
-
-def load_email_config():
-    global user_email
-    try:
-        with open("email_config.json", "r", encoding="utf-8") as f:
-            user_email = json.load(f)
-    except FileNotFoundError:
-        user_email = {}
-
-def save_email_config():
-    with open("email_config.json", "w", encoding="utf-8") as f:
-        json.dump(user_email, f, ensure_ascii=False, indent=2)
-
-def save_favorites():
-    """保存收藏夹数据"""
-    cache_dir = os.path.join(load_address(),"list/")
-    os.makedirs(cache_dir, exist_ok=True)
-    
-    # 保存用户收藏
-    with open(os.path.join(cache_dir, "user_favorites.json"), 'w', encoding='utf-8') as f:
-        json.dump(user_favorites, f, ensure_ascii=False, indent=2)
-    
-    # 保存群组收藏
-    with open(os.path.join(cache_dir, "group_favorites.json"), 'w', encoding='utf-8') as f:
-        json.dump(group_favorites, f, ensure_ascii=False, indent=2)
-
-async def schedule_task(delay_hours: float, task_func, *args, **kwargs):
-    """延时执行任务
-    :param delay_hours: 延迟的小时数
-    :param task_func: 要执行的函数
-    """
-    await asyncio.sleep(delay_hours * 3600)  # 转换为秒
-    await task_func(*args, **kwargs)
-
-async def schedule_task_by_date(target_time: datetime, task_func, *args, **kwargs):
-    """精确时间执行任务
-    :param target_time: 目标日期时间(datetime对象)
-    :param task_func: 要执行的函数
-    """
-    now = datetime.now()
-    if target_time < now:
-        raise ValueError("目标时间不能是过去时间喵~")
-    delay_seconds = (target_time - now).total_seconds()
-    await asyncio.sleep(delay_seconds)
-    await task_func(*args, **kwargs)
-
-async def schedule_job_task(delay_hours: float,loop:bool,name:str, task_func, *args, **kwargs):
-    """延时执行任务
-    :param delay_hours: 延迟的小时数
-    :param loop: 是否循环执行
-    :param name: 任务名称
-    :param task_func: 要执行的函数
-    """
-    if loop:
-        while True:
-            await asyncio.sleep(delay_hours * 3600)  # 转换为秒
-            await task_func(*args, **kwargs)
-            _log.info(f"任务 {name} 执行完成")
-    else:
-        await asyncio.sleep(delay_hours * 3600)  # 转换为秒
-        await task_func(*args, **kwargs)
-        _log.info(f"任务 {name} 执行完成")
-        del schedule_tasks[name]
-
-async def chatter(id):
-    """
-    定时聊天函数。
-    :param msg: 消息对象。
-    """
-    content = chat(content="现在请你根据上下文，主动和用户聊天",user_id=id)
-    content, _ = safe_parse_chat_response(content)
-    if if_tts:
-        rtf = tts(content)
-        await bot.api.post_private_msg(id, rtf=rtf)
-        await bot.api.post_private_msg(id, text=content)    
-    else:
-        await bot.api.post_private_msg(id, text=content)
-
-async def chat_loop(id:str):
-    """
-    单人定时聊天任务
-    :param id: QQ号(msg.user_id)
-    """
-    global running
-    running[id]["state"] = True
-    write_running()
-    
-    while True:
-        # 检查是否仍处于激活状态
-        if not running.get(id, {}).get("active", False):
-            running[id]["state"] = False
-            write_running()
-            break
-            
-        try:
-            date_time = datetime.now()
-            current_time = time.time()
-            last_time = running[id].get("last_time", 0)
-            
-            # 只在8点到24点之间运行
-            if date_time.hour < 8 or date_time.hour >= 24:
-                await asyncio.sleep(60 * 10)  # 10分钟检查一次
-                continue
-                
-            # 计算剩余等待时间
-            time_remaining = (60 * 60 * running[id]["interval"]) - (current_time - last_time)
-            
-            # 如果还没到时间，精确等待剩余时间
-            if time_remaining > 0:
-                await asyncio.sleep(min(time_remaining, 60 * 10))  # 最多等待10分钟
-                continue
-                
-            # 发送聊天消息
-            await chatter(id)
-            running[id]["last_time"] = current_time
-            write_running()
-            
-            # 等待完整间隔时间
-            await asyncio.sleep(60 * 60 * running[id]["interval"])
-            
-        except Exception as e:
-            _log.error(f"主动聊天循环出错: {e}")
-            await asyncio.sleep(60)  # 出错后等待1分钟再重试
-
-def write_blak_list():
-    """
-    写入黑名单
-    """
-    cache_dir = os.path.join(load_address(),"black_list/")
-    os.makedirs(cache_dir, exist_ok=True)
-    try:
-        with open(os.path.join(cache_dir,"blak_list.json"), "w", encoding="utf-8") as f:
-            json.dump(black_list_comic, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        _log.error(f"写入黑名单文件失败: {e}")
-
-def load_blak_list():
-    """
-    加载黑名单
-    """
-    cache_dir = os.path.join(load_address(),"black_list/")
-    os.makedirs(cache_dir, exist_ok=True)
-    try:
-        with open(os.path.join(cache_dir,"blak_list.json"), "r", encoding="utf-8") as f:
-            black_list_comic.update(json.load(f))
-
-    except FileNotFoundError:
-        write_blak_list()
-
-def write_running():
-    """
-    写入定时聊天开关
-    """
-    cache_dir = os.path.join(load_address(),"running/")
-    os.makedirs(cache_dir, exist_ok=True)
-    try:
-        with open(os.path.join(cache_dir,"running.json"), "w", encoding="utf-8") as f:
-            json.dump(running, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        _log.error(f"写入定时聊天开关文件失败: {e}")
-
-def normalize_timestamp(ts):
-    try:
-        value = float(ts)
-    except Exception:
-        return 0.0
-    if value > 1e11:
-        return value / 1000.0
-    return value
-
-def load_running():
-    """
-    加载定时聊天开关
-    """
-    cache_dir = os.path.join(load_address(),"running/")
-    os.makedirs(cache_dir, exist_ok=True)
-    try:
-        with open(os.path.join(cache_dir,"running.json"), "r", encoding="utf-8") as f:
-            data = json.load(f)
-            for uid, info in data.items():
-                if isinstance(info, dict) and "last_time" in info:
-                    info["last_time"] = normalize_timestamp(info["last_time"])
-            running.update(data)
-    except FileNotFoundError:
-        write_running()
-
-def update_user_active_chat_time(user_id):
-    """
-    当用户主动发消息时，更新最后活跃时间。
-    这会推迟机器人的下一次主动聊天。
-    """
-    user_id = str(user_id)
-    if user_id in running and running[user_id].get("active", False):
-        running[user_id]["last_time"] = time.time()
-        write_running()
-
-def update_running(id):
-    if id in tasks:
-        tasks[id].cancel()  # 取消之前的任务
-        tasks[id] = asyncio.create_task(chat_loop(id))  # 创建新的任务
-        
-def load_novel_data():
-    """
-    加载小说数据
-    """
-    with open("resources/config/novel_details2.json", "r", encoding="utf-8") as f:
-        books.update(json.load(f))
-
-def fetch_cover_url(id:str, client=None) -> str:
-    """
-    获取指定本子的第一张图片URL
-    :param album_id: 本子ID
-    :return: 第一张图片的URL
-    """
-    filename = "00001.webp"
-    fallback_url = f"https://cdn-msp3.jmapinodeudzn.net/media/photos/{id}/{filename}"
-    cache_dir = os.path.join(load_address(), "jm_cover_cache")
-    os.makedirs(cache_dir, exist_ok=True)
-    cache_path = os.path.join(cache_dir, f"{id}.jpg")
-
-    try:
-        if not os.path.exists(cache_path):
-            client = client or JmOption.default().new_jm_client()
-            album = client.get_album_detail(id)
-            decoded_path = os.path.join(cache_dir, f"{id}_decoded.jpg")
-            client.download_image(
-                fallback_url,
-                decoded_path,
-                int(album.scramble_id),
-                decode_image=True,
-            )
-
-            with PILImage.open(decoded_path) as image:
-                image = image.convert("RGB")
-                image.thumbnail((260, 380))
-                image.save(cache_path, format="JPEG", quality=72, optimize=True)
-
-            if os.path.exists(decoded_path):
-                os.remove(decoded_path)
-
-        with open(cache_path, "rb") as file_obj:
-            encoded = base64.b64encode(file_obj.read()).decode("ascii")
-            return f"data:image/jpeg;base64,{encoded}"
-    except Exception as e:
-        _log.warning(f"获取JM封面失败，回退原图链接: album_id={id}, error={e}")
-        return fallback_url
-
-
-# ----------------------
-# 公共 HTML 卡片模板
-# ----------------------
-
-def build_jm_grid_html(title: str, filepath: str):
-    """写入 JM 卡片网格的 HTML 头部（需要调用方后续追加 card，再调用 close_jm_grid_html）"""
-    html_head = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{html.escape(title)}</title>
-  <style>
-    body {{ font-family: 'Segoe UI', 'PingFang SC', sans-serif; background:#111827; color:#f3f4f6; margin:0; padding:24px; }}
-    h1 {{ font-size:24px; margin:0 0 20px; }}
-    .note {{ color:#9ca3af; font-size:13px; margin:-8px 0 18px; }}
-    .grid {{ display:grid; grid-template-columns:repeat(auto-fill, minmax(220px, 1fr)); gap:18px; }}
-    .card {{ background:#1f2937; border:1px solid rgba(255,255,255,0.08); border-radius:16px; overflow:hidden; box-shadow:0 10px 24px rgba(0,0,0,0.22); transition: transform 0.2s, box-shadow 0.2s; }}
-    .card:hover {{ transform: translateY(-4px); box-shadow:0 14px 28px rgba(0,0,0,0.3); }}
-    .card a {{ text-decoration:none; color:inherit; display:block; }}
-    .cover {{ width:100%; aspect-ratio: 13 / 18; object-fit:cover; display:block; background:#0b1220; }}
-    .meta {{ padding:12px 14px 16px; }}
-    .num {{ color:#60a5fa; font-weight:700; font-size:13px; margin-bottom:6px; }}
-    .title {{ font-size:14px; line-height:1.45; word-break:break-word; }}
-    .aid {{ color:#9ca3af; font-size:12px; margin-top:8px; }}
-  </style>
-</head>
-<body>
-  <h1>{html.escape(title)}</h1>
-  <div class="note">前 {JM_RANK_DECODE_LIMIT} 张封面会做顺序修复，后续封面直接展示以保证生成速度。</div>
-  <div class="grid">
-"""
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(html_head)
-
-
-def append_jm_card(filepath: str, album_id: int, title: str, seq: int, client=None):
-    """追加一张卡片到已打开的 HTML 文件（流式写入）"""
-    if seq <= JM_RANK_DECODE_LIMIT:
-        cover_url = fetch_cover_url(str(album_id), client=client)
-    else:
-        cover_url = f"https://cdn-msp3.jmapinodeudzn.net/media/photos/{album_id}/00001.webp"
-    album_url = f"https://jmcm.la/album/{album_id}"
-    with open(filepath, "a", encoding="utf-8") as f:
-        f.write(
-            f'    <article class="card">'
-            f'<a href="{html.escape(album_url, quote=True)}" target="_blank">'
-            f'<img class="cover" src="{html.escape(cover_url, quote=True)}" alt="{html.escape(title, quote=True)}">'
-            f'<div class="meta">'
-            f'<div class="num">#{seq}</div>'
-            f'<div class="title">{html.escape(title)}</div>'
-            f'<div class="aid">ID: {html.escape(str(album_id))}</div>'
-            f'</div></a></article>\n'
-        )
-
-
-def close_jm_grid_html(filepath: str):
-    """关闭 HTML 网格文件"""
-    with open(filepath, "a", encoding="utf-8") as f:
-        f.write("  </div>\n</body>\n</html>\n")
-
-
-def build_novel_grid_html(title: str, filepath: str):
-    """写入轻小说卡片网格的 HTML 头部"""
-    html_head = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{html.escape(title)}</title>
-  <style>
-    body {{ font-family: 'Segoe UI', 'PingFang SC', sans-serif; background:#111827; color:#f3f4f6; margin:0; padding:24px; }}
-    h1 {{ font-size:24px; margin:0 0 20px; }}
-    .note {{ color:#9ca3af; font-size:13px; margin:-8px 0 18px; }}
-    .grid {{ display:grid; grid-template-columns:repeat(auto-fill, minmax(220px, 1fr)); gap:18px; }}
-    .card {{ background:#1f2937; border:1px solid rgba(255,255,255,0.08); border-radius:16px; overflow:hidden; box-shadow:0 10px 24px rgba(0,0,0,0.22); transition: transform 0.2s, box-shadow 0.2s; }}
-    .card:hover {{ transform: translateY(-4px); box-shadow:0 14px 28px rgba(0,0,0,0.3); }}
-    .card a {{ text-decoration:none; color:inherit; display:block; }}
-    .cover {{ width:100%; aspect-ratio: 3 / 4; object-fit:cover; display:block; background:#0b1220; }}
-    .meta {{ padding:12px 14px 16px; }}
-    .author {{ color:#60a5fa; font-weight:700; font-size:13px; margin-bottom:6px; }}
-    .title {{ font-size:14px; line-height:1.45; word-break:break-word; }}
-    .info {{ color:#9ca3af; font-size:12px; margin-top:8px; }}
-  </style>
-</head>
-<body>
-  <h1>{html.escape(title)}</h1>
-  <div class="note">点击卡片查看小说详情或下载喵~</div>
-  <div class="grid">
-"""
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(html_head)
-
-
-def append_novel_card(filepath: str, book_id: str, title: str, author: str, seq: int, cover_url: str = None):
-    """追加一张轻小说卡片到已打开的 HTML 文件"""
-    node = int(book_id) // 1000 if book_id.isdigit() else 0
-    if not cover_url:
-        cover_url = f"https://img.wenku8.com/image/{node}/{book_id}/{book_id}s.jpg"
-    page_url = f"https://www.wenku8.net/book/{book_id}.htm"
-    with open(filepath, "a", encoding="utf-8") as f:
-        f.write(
-            f'    <article class="card">'
-            f'<a href="{html.escape(page_url, quote=True)}" target="_blank">'
-            f'<img class="cover" src="{html.escape(cover_url, quote=True)}" alt="{html.escape(title, quote=True)}">'
-            f'<div class="meta">'
-            f'<div class="author">{html.escape(author)}</div>'
-            f'<div class="title">{html.escape(title)}</div>'
-            f'<div class="info">ID: {html.escape(book_id)}</div>'
-            f'</div></a></article>\n'
-        )
-
-
-def close_novel_grid_html(filepath: str):
-    """关闭轻小说 HTML 网格文件"""
-    with open(filepath, "a", encoding="utf-8") as f:
-        f.write("  </div>\n</body>\n</html>\n")
-
-
-def build_novel_detail_html(title: str, info: dict, filepath: str):
-    """生成单本轻小说详情页 HTML"""
-    book_id_match = re.search(r'/book/(\d+)\.htm', info.get('page', ''))
-    book_id = book_id_match.group(1) if book_id_match else "0"
-    node = int(book_id) // 1000 if book_id.isdigit() else 0
-    cover_url = info.get('cover_url') or f"https://img.wenku8.com/image/{node}/{book_id}/{book_id}s.jpg"
-    page_url = info.get('page') or f"https://www.wenku8.net/book/{book_id}.htm"
-    download_url = info.get('download_url') or f"https://dl.wenku8.com/down.php?type=txt&node={node}&id={book_id}"
-    
-    html_content = f"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>{html.escape(title)} - 轻小说详情</title>
-  <style>
-    body {{ font-family: 'Segoe UI', 'PingFang SC', sans-serif; background:#111827; color:#f3f4f6; margin:0; padding:24px; }}
-    .card {{ background:#1f2937; border:1px solid rgba(255,255,255,0.08); border-radius:16px; overflow:hidden; box-shadow:0 10px 24px rgba(0,0,0,0.22); max-width:500px; margin:0 auto; }}
-    .cover {{ width:100%; aspect-ratio: 3 / 4; object-fit:cover; display:block; background:#0b1220; }}
-    .meta {{ padding:20px; }}
-    .title {{ font-size:20px; font-weight:700; margin-bottom:12px; line-height:1.4; }}
-    .author {{ color:#60a5fa; font-size:14px; margin-bottom:16px; }}
-    .info-row {{ display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.05); font-size:13px; }}
-    .info-label {{ color:#9ca3af; }}
-    .info-value {{ color:#f3f4f6; }}
-    .intro {{ margin-top:16px; padding:12px; background:rgba(0,0,0,0.2); border-radius:8px; font-size:13px; line-height:1.6; }}
-    .intro-title {{ color:#60a5fa; font-weight:600; margin-bottom:8px; }}
-    .actions {{ display:flex; gap:12px; margin-top:20px; }}
-    .btn {{ flex:1; padding:12px; border-radius:8px; text-align:center; text-decoration:none; font-size:14px; font-weight:600; transition:opacity 0.2s; }}
-    .btn:hover {{ opacity:0.9; }}
-    .btn-primary {{ background:#4a9eff; color:white; }}
-    .btn-secondary {{ background:#374151; color:white; }}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <img class="cover" src="{html.escape(cover_url, quote=True)}" alt="{html.escape(title, quote=True)}">
-    <div class="meta">
-      <div class="title">{html.escape(title)}</div>
-      <div class="author">作者：{html.escape(info.get('author', '未知'))}</div>
-      <div class="info-row">
-        <span class="info-label">分类</span>
-        <span class="info-value">{html.escape(info.get('category', '未知'))}</span>
-      </div>
-      <div class="info-row">
-        <span class="info-label">字数</span>
-        <span class="info-value">{html.escape(info.get('word_count', '未知'))}</span>
-      </div>
-      <div class="info-row">
-        <span class="info-label">状态</span>
-        <span class="info-value">{html.escape(info.get('is_serialize', '未知'))}</span>
-      </div>
-      <div class="info-row">
-        <span class="info-label">更新日期</span>
-        <span class="info-value">{html.escape(info.get('last_date', '未知'))}</span>
-      </div>
-      <div class="info-row">
-        <span class="info-label">热度</span>
-        <span class="info-value">{html.escape(str(info.get('hot', '未知')))}</span>
-      </div>
-      <div class="intro">
-        <div class="intro-title">简介</div>
-        <div>{html.escape(info.get('introduction', '暂无简介'))}</div>
-      </div>
-      <div class="actions">
-        <a href="{html.escape(page_url, quote=True)}" target="_blank" class="btn btn-secondary">查看详情</a>
-        <a href="{html.escape(download_url, quote=True)}" target="_blank" class="btn btn-primary">下载小说</a>
-      </div>
-    </div>
-  </div>
-</body>
-</html>"""
-    
-    with open(filepath, "w", encoding="utf-8") as f:
-        f.write(html_content)
-
+# Apply message patches (records bot-sent messages to history)
+apply_message_patches()
+
+# Populate the nbot.commands package with bot and switch so submodules
+# can import them via "from nbot.commands import bot, switch".
+import nbot.commands as _commands_pkg
+_commands_pkg.bot = bot
+
+#-------------------------
+#     region Load data
+#-------------------------
+
+load_favorites()
+load_admin()
+load_blak_list()
+load_running()
+load_novel_data()
+read_at_all_group()
+load_smtp_config()
+load_email_config()
+
+#-------------------------
+#     region SwitchManager
+#-------------------------
 
 class SwitchManager:
     """
@@ -806,19 +246,7 @@ class SwitchManager:
             # 文件不存在时使用默认值
             pass
 
-#-------------------------
-#     region 加载参数
-#-------------------------
-
-load_favorites()
-load_admin()
-load_blak_list()
-load_running()
-load_novel_data()
-read_at_all_group()
-load_smtp_config()
-load_email_config()
-switch = SwitchManager() #加载开关
+switch = SwitchManager()  # 加载开关
 switch.load_switches()
 switch.add_switch('tts', default_value=False, description='TTS语音开关')
 switch.add_switch('jm_send', default_value=True, description='漫画发送开关')
@@ -830,6 +258,9 @@ switch.add_switch('active_chat', default_value=False, description='主动聊天�
 switch.add_switch('auto_reply', default_value=False, description='群聊智能自动回复开关')
 switch.add_switch('jm_send_email', default_value=False, description='漫画邮箱发送开关')
 switch.save_switches()
+
+# Export switch to the commands package
+_commands_pkg.switch = switch
 
 #----------------------
 #     region 命令
@@ -1557,123 +988,10 @@ async def handle_shutdown(msg, is_group=True):
 
 #------以下为调用api发送文件的命令，采用异步方式发送文件------
 # 新增后台任务函数
-async def async_send_file(is_group,send_method, target_id, file_type, url,file_name):
-    try:
-        # 处理可能的重定向
-        loop = asyncio.get_event_loop()
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-        }
-        response = await loop.run_in_executor(None, lambda: get_sync(url, allow_redirects=True, timeout=10,headers=headers))
-        final_url = response.url
 
-        # 异步发送文件
-        if is_group:
-            await send_method(target_id, **{file_type: final_url})
-        else:
-            await send_method(target_id, **{file_type: final_url})
-    except Exception as e:
-        error_msg = f"发送失败喵~: {str(e)}"
-        if is_group:
-            await msg.reply(text=error_msg)
-        else:
-            await bot.api.post_private_msg(target_id, text=error_msg)
 
-def _send_comic_email_sync(to_addr, subject, body, file_path, conf):
-    if not conf:
-        raise ValueError("smtp未配置")
-    host = conf.get("host")
-    port = int(conf.get("port", 587))
-    user = conf.get("user")
-    password = conf.get("password")
-    use_tls = bool(conf.get("use_tls", True))
-    from_addr = conf.get("from_addr") or user
-    if not host or not from_addr:
-        raise ValueError("smtp配置不完整")
-    msg = MIMEMultipart()
-    msg["From"] = from_addr
-    msg["To"] = to_addr
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain", "utf-8"))
-    with open(file_path, "rb") as f:
-        part = MIMEBase("application", "pdf")
-        part.set_payload(f.read())
-    encoders.encode_base64(part)
-    part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(file_path)}"')
-    msg.attach(part)
-    server = smtplib.SMTP(host, port, timeout=30)
-    if use_tls:
-        server.starttls()
-    if user and password:
-        server.login(user, password)
-    server.sendmail(from_addr, [to_addr], msg.as_string())
-    server.quit()
 
-async def send_comic_email(user_id, comic_id, file_path):
-    uid = str(user_id)
-    to_addr = user_email.get(uid)
-    if not to_addr:
-        return False
-    conf = smtp_config.get(uid) or smtp_config.get("global")
-    if not conf:
-        return False
-    subject = f"漫画 {comic_id}"
-    body = f"漫画 {comic_id} 已发送喵~"
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, lambda: _send_comic_email_sync(to_addr, subject, body, file_path, conf))
-    return True
-            
 # 修改通用处理函数
-async def handle_generic_file(msg, is_group: bool, section: str, file_type: str, custom_url: str = None, file_name:str = None,custom_send_method=None):
-    """通用文件处理函数
-       :param msg: 消息对象
-       :param is_group: 是否为群组消息
-       :param section: 配置文件中的section名称(可选)
-       :param file_type: 文件类型(image、record、video、file、markdown)
-       :param custom_url: 自定义URL(可选)
-       :param file_name: 文件名(可选)
-       :param custom_send_method: 发送方法(可选)
-    """
-    """
-        支持的file_type:
-        image: 图片
-        record: 语音
-        video: 视频
-        file: 文件
-        markdown: Markdown
-    """
-
-    try:
-        # 修复配置读取逻辑
-        if section:  # 仅当需要读取配置文件时
-            loop = asyncio.get_event_loop()
-            # 正确读取配置的方式
-            def read_config():
-                cfg = configparser.ConfigParser()
-                cfg.read('resources/config/urls.ini')
-                if not cfg.has_section(section):
-                    raise Exception(f"配置文件中缺少 [{section}] 段落")
-                return cfg
-
-            config = await loop.run_in_executor(None, read_config)
-            urls = json.loads(config.get(section, 'urls'))
-            selected_url = random.choice(urls)
-        else:  # 使用自定义URL
-            selected_url = custom_url
-
-        # 创建后台任务
-        send_method = bot.api.post_group_file if is_group else bot.api.post_private_file
-        target_id = msg.group_id if is_group else msg.user_id
-        if custom_send_method:
-            await async_send_file(is_group,custom_send_method, target_id, file_type, selected_url,file_name)
-        else:
-            asyncio.create_task(
-                async_send_file(is_group,send_method, target_id, file_type, selected_url,file_name)
-            )
-
-    except Exception as e:
-        error_msg = f"配置错误喵~: {str(e)}" if '配置' in str(e) else f"获取失败喵~: {str(e)}"
-        await send_text(msg, error_msg, is_group=is_group)
 
 # 统一调用
 @register_command("/random_image","/ri",help_text = "/random_image 或者 /ri -> 随机图片",category = "3")
@@ -3410,21 +2728,6 @@ async def handle_rec(msg, is_group=True):
     return
 
 @register_command("/at_all",help_text = "/at_all -> 识别@全体成员功能(admin)",category = "2",admin_show=True)
-async def handle_at_all_group(msg, is_group=True):
-    if is_group:
-        if str(msg.user_id) not in admin:
-            await msg.reply(text="只有管理员才能使用该命令喵~")
-            return
-        if str(msg.group_id) in at_all_group:
-            at_all_group.remove(str(msg.group_id))
-            write_at_all_group()
-            await msg.reply(text="关闭成功喵~")
-            return
-        at_all_group.append(str(msg.group_id))
-        write_at_all_group()
-        await msg.reply(text="开启成功喵~")
-    else:
-        await bot.api.post_private_msg(msg.user_id,text="请在群聊中使用该命令")
 
 # ========== 工作区命令 ==========
 @register_command("/workspace", "/ws", help_text="/workspace 或 /ws -> 查看当前会话工作区文件列表", category="3")
@@ -3499,117 +2802,8 @@ async def handle_ws_send(msg, is_group=True):
 
 #将help命令放在最后
 @register_command("/help","/h",help_text = "/help 或者 /h -> 查看帮助",category = "8")
-async def handle_help(msg, is_group=True):
-    command_categories = {
-        "1": {"name": "漫画相关"},
-        "2": {"name": "聊天设置"},
-        "3": {"name": "娱乐功能"},
-        "4": {"name": "系统处理"},
-        "5": {"name": "群聊管理"},
-        "6": {"name": "轻小说"},
-        "7": {"name": "定时任务"},
-        "8": {"name": "全部功能"}
-    }
-    # 显示分类菜单
-    if not msg.raw_message.strip().endswith("help") and not msg.raw_message.strip().endswith("h"):
-        # 用户选择了分类
-        selected_category = msg.raw_message.split()[-1]
-        if selected_category in command_categories:
-        # 显示该分类下的详细命令
-            help_text = f"{command_categories[selected_category]['name']}命令喵~\n"
-            if str(msg.user_id) in admin:
-                command_categories = {
-                    "1": {"name": "漫画相关", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "1"]},
-                    "2": {"name": "聊天设置", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "2"]},
-                    "3": {"name": "娱乐功能", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "3"]},
-                    "4": {"name": "系统处理", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "4"]},
-                    "5": {"name": "群聊管理", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "5"]},
-                    "6": {"name": "轻小说", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "6"]},
-                    "7": {"name": "定时任务", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "7"]}
-                }
-                # 添加全部功能分类
-                command_categories["8"] = {
-                    "name": "全部功能", 
-                    "commands": [cmd for category in command_categories.values() for cmd in category["commands"]] + ["/help 或者 /h -> 查看帮助"]
-                 }
-                for cmd_text in command_categories[selected_category]['commands']:
-                    help_text += f"{cmd_text}\n"
-            else:
-                command_categories = {
-                    "1": {"name": "漫画相关", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "1" and handler.admin_show == False]},
-                    "2": {"name": "聊天设置", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "2" and handler.admin_show == False]},
-                    "3": {"name": "娱乐功能", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "3" and handler.admin_show == False]},
-                    "4": {"name": "系统处理", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "4" and handler.admin_show == False]},
-                    "5": {"name": "群聊管理", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "5" and handler.admin_show == False]},
-                    "6": {"name": "轻小说", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "6" and handler.admin_show == False]},
-                    "7": {"name": "定时任务", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "7" and handler.admin_show == False]}
-                }
-                # 添加全部功能分类
-                command_categories["8"] = {
-                    "name": "全部功能", 
-                    "commands": [cmd for category in command_categories.values() for cmd in category["commands"]] + ["/help 或者 /h -> 查看帮助"]
-                }
-                if len(command_categories[selected_category]['commands']) == 0:
-                    help_text += "你没有权限查看当前分类的命令喵~\n"
 
-                for cmd_text in command_categories[selected_category]['commands']:
-                    help_text += f"{cmd_text}\n"
-                
-            await send_text(msg, help_text, is_group=is_group)
-            return
 
-    # 显示主帮助菜单
-    help_text = "欢迎使用喵~ 请选择分类查看详细命令喵~\n"
-    for num, category in command_categories.items():
-        help_text += f"{num}. {category['name']}\n"
-    
-    help_text += "\n输入 /help 或者 /h 加分类编号查看详细命令，例如: /help 1"
-
-    help_text += "\n\n 一共有"+str(len(command_handlers))+"个命令"
-    
-    await send_text(msg, help_text, is_group=is_group)
-
-def get_all_help_text_for_prompt() -> str:
-    command_categories = {
-        "1": {"name": "漫画相关", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "1"]},
-        "2": {"name": "聊天设置", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "2"]},
-        "3": {"name": "娱乐功能", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "3"]},
-        "4": {"name": "系统处理", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "4"]},
-        "5": {"name": "群聊管理", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "5"]},
-        "6": {"name": "轻小说", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "6"]},
-        "7": {"name": "定时任务", "commands": [handler.help_text for handler in command_handlers.values() if handler.category == "7"]}
-    }
-    command_categories["8"] = {
-        "name": "全部功能",
-        "commands": [cmd for category in command_categories.values() for cmd in category["commands"]] + ["/help 或者 /h -> 查看帮助"]
-    }
-    help_text = "以下是全部命令：\n"
-    for cmd_text in command_categories["8"]["commands"]:
-        if cmd_text:
-            help_text += f"{cmd_text}\n"
-    help_text += "\n一共有"+str(len(command_handlers))+"个命令"
-    return help_text
-
-def parse_command_string(cmd_str):
-    # 提取函数名和参数部分，支持带点的函数名
-    func_match = re.match(r'^/([\w.]+)\((.*)\)$', cmd_str)
-    if not func_match:
-        return None
-    
-    func_name = func_match.group(1)
-    params_str = func_match.group(2)
-    
-    # 解析参数
-    params = {}
-    for param in re.finditer(r'([\w.]+)\s*=\s*"([^"]*)"', params_str):
-        key = param.group(1)
-        value = param.group(2)
-        params[key] = value
-    
-    return {
-        'func': func_name,
-        'params': params
-    }
 
 @register_command("/translate", "/tr", help_text="/translate <文本> -> 将文本翻译为中文/英文", category="3")
 async def handle_translate(msg, is_group=True):
@@ -3669,39 +2863,6 @@ async def handle_fortune(msg, is_group=True):
     if is_group: await msg.reply(text=reply)
     else: await bot.api.post_private_msg(msg.user_id, text=reply)
 
-@register_command("/bot",help_text="/bot.api.函数名(参数1=值1,参数2=值2) -> 用户自定义api(admin)，详情可见https://docs.ncatbot.xyz/guide/p8aun9nh/",category = "4",admin_show=True)
-async def handle_api(msg,is_group):
-    dict = parse_command_string(msg.raw_message)
-    command = dict["func"]
-    params = dict["params"]
-    if command == "":
-        return
-    if str(msg.user_id) not in admin:
-        text = "没有权限喵~"
-        await send_text(msg, text, is_group=is_group)
-        return
-    # 将命令字符串转换为bot.api中的方法
-    try:
-        func = getattr(bot.api, command.split('.')[-1])
-        res = await func(**params)
-        res = str(res)
-        await send_text(msg, res, is_group=is_group)
-    except Exception as e:
-        text = f"执行命令时出错喵~：{e}"
-        await send_text(msg, text, is_group=is_group)
-
-
-async def handle_group_message(msg):
-    """处理群消息"""
-    is_group = True
-    await dispatch_message(msg, is_group)
-
-
-async def handle_private_message(msg):
-    """处理私聊消息"""
-    is_group = False
-    await dispatch_message(msg, is_group)
-
 
 # 获取机器人QQ号
 config_parser = configparser.ConfigParser()
@@ -3709,263 +2870,13 @@ config_parser.read('config.ini', encoding='utf-8')
 BOT_UIN = str(config_parser.get('BotConfig', 'bot_uin', fallback="")).strip()
 
 
-def _normalize_qq_id(value) -> str:
-    if value is None:
-        return ""
-    text = str(value).strip()
-    if text.endswith(".0") and text[:-2].isdigit():
-        text = text[:-2]
-    return text
 
 
-def _get_value(source, *keys):
-    for key in keys:
-        if isinstance(source, dict) and key in source:
-            return source.get(key)
-        if hasattr(source, key):
-            return getattr(source, key)
-    return None
 
 
-def _bot_uin_candidates(msg=None):
-    candidates = set()
-    for value in (BOT_UIN, bot_id):
-        qq_id = _normalize_qq_id(value)
-        if qq_id:
-            candidates.add(qq_id)
-
-    if msg is not None:
-        for attr in ("self_id", "bot_id", "bot_uin", "login_uin"):
-            qq_id = _normalize_qq_id(getattr(msg, attr, None))
-            if qq_id:
-                candidates.add(qq_id)
-
-        for attr in ("sender", "self", "login_info"):
-            nested = getattr(msg, attr, None)
-            qq_id = _normalize_qq_id(_get_value(nested, "self_id", "bot_id", "user_id", "uin", "qq", "id"))
-            if qq_id:
-                candidates.add(qq_id)
-
-    return candidates
 
 
-def _iter_mention_ids(value):
-    if value is None:
-        return
 
-    if isinstance(value, (list, tuple, set)):
-        for item in value:
-            yield from _iter_mention_ids(item)
-        return
-
-    data = _get_value(value, "data")
-    if data is not None and data is not value:
-        for key in ("qq", "user_id", "uin", "id", "target", "target_id"):
-            qq_id = _normalize_qq_id(_get_value(data, key))
-            if qq_id:
-                yield qq_id
-
-    for key in ("qq", "user_id", "uin", "id", "target", "target_id"):
-        qq_id = _normalize_qq_id(_get_value(value, key))
-        if qq_id:
-            yield qq_id
-
-    if isinstance(value, (str, int, float)):
-        qq_id = _normalize_qq_id(value)
-        if qq_id:
-            yield qq_id
-
-
-def _iter_message_segments(msg):
-    for attr in ("message", "message_chain", "message_array"):
-        segments = getattr(msg, attr, None)
-        if not segments:
-            continue
-        if isinstance(segments, (str, bytes)):
-            continue
-        for segment in segments:
-            yield segment
-
-
-def _is_at_all_enabled(msg, mention_id: str) -> bool:
-    if mention_id.lower() != "all" and mention_id != "全体成员":
-        return False
-    group_id = _normalize_qq_id(getattr(msg, "group_id", None))
-    return bool(group_id and group_id in at_all_group)
-
-
-def is_at_bot(msg) -> bool:
-    """检查消息是否@了机器人"""
-    bot_uins = _bot_uin_candidates(msg)
-    raw_message = str(getattr(msg, "raw_message", "") or "")
-
-    for attr in ("is_at_me", "at_me", "to_me"):
-        if getattr(msg, attr, False):
-            return True
-
-    for mention_id in re.findall(r"\[CQ:at[^\]]*(?:qq|id|target)=([^,\]\s]+)", raw_message):
-        mention_id = _normalize_qq_id(mention_id)
-        if mention_id in bot_uins or _is_at_all_enabled(msg, mention_id):
-            return True
-
-    for attr in ("at_list", "at", "mentions", "mention_list"):
-        for mention_id in _iter_mention_ids(getattr(msg, attr, None)):
-            if mention_id in bot_uins or _is_at_all_enabled(msg, mention_id):
-                return True
-
-    for segment in _iter_message_segments(msg):
-        segment_type = str(_get_value(segment, "type", "msg_type") or "").lower()
-        if segment_type not in ("at", "mention"):
-            continue
-        for mention_id in _iter_mention_ids(segment):
-            if mention_id in bot_uins or _is_at_all_enabled(msg, mention_id):
-                return True
-
-    for bot_uin in bot_uins:
-        if bot_uin and bot_uin in raw_message:
-            return True
-
-    return False
-
-
-def _save_incoming_files_to_workspace(msg, is_group: bool):
-    """检测消息中的文件并保存到工作区"""
-    if not WORKSPACE_AVAILABLE:
-        _log.debug("[文件保存] 工作区不可用")
-        return
-    from nbot.core.workspace import workspace_manager
-
-    if is_group:
-        session_id = get_qq_session_id(group_id=str(msg.group_id), group_user_id=str(msg.user_id))
-        session_type = "qq_group"
-    else:
-        session_id = get_qq_session_id(user_id=str(msg.user_id))
-        session_type = "qq_private"
-
-    _log.info(f"[文件保存] 开始检查消息，session_id={session_id}, type={session_type}")
-
-    # 方法1: 检查 msg.message 中的文件元素
-    if hasattr(msg, 'message') and msg.message:
-        _log.info(f"[文件保存] 消息元素数量: {len(msg.message)}")
-
-        for elem in msg.message:
-            if not hasattr(elem, 'type'):
-                _log.debug(f"[文件保存] 元素没有type属性: {elem}")
-                continue
-            
-            _log.info(f"[文件保存] 检查元素类型: {elem.type}")
-            
-            # 处理文件类型消息
-            if elem.type == 'file':
-                file_url = elem.data.get('url', '') if hasattr(elem, 'data') else ''
-                file_name = elem.data.get('name', 'unknown_file') if hasattr(elem, 'data') else 'unknown_file'
-                _log.info(f"[文件保存] 发现文件: {file_name}, URL: {file_url[:50] if file_url else '空'}...")
-                if file_url:
-                    try:
-                        resp = get_sync(file_url, timeout=30)
-                        _log.info(f"[文件保存] 下载响应: {resp.status_code}")
-                        if resp.status_code == 200:
-                            result = workspace_manager.save_uploaded_file(
-                                session_id, resp.content, file_name, session_type)
-                            _log.info(f"[文件保存] 保存成功: {result}")
-                        else:
-                            _log.warning(f"[文件保存] 下载失败，状态码: {resp.status_code}")
-                    except Exception as e:
-                        _log.warning(f"[文件保存] 保存失败: {file_name}, {e}", exc_info=True)
-            else:
-                _log.debug(f"[文件保存] 非文件类型元素: {elem.type}")
-    
-    # 方法2: 从 raw_message 解析 CQ 码格式的文件
-    if hasattr(msg, 'raw_message') and msg.raw_message:
-        raw_msg = msg.raw_message
-        _log.info(f"[文件保存] 检查 raw_message: {raw_msg[:100]}...")
-        
-        # 匹配 [CQ:file,file=文件名,file_id=xxx,url=xxx] 格式
-        file_cq_pattern = r'\[CQ:file[^,]*,file=([^,\]]+)(?:[^,]*,file_id=([^,\]]+))?(?:[^,]*,url=([^,\]]+))?[^\]]*\]'
-        file_matches = re.findall(file_cq_pattern, raw_msg)
-        
-        if file_matches:
-            _log.info(f"[文件保存] 从 CQ 码发现 {len(file_matches)} 个文件")
-            for match in file_matches:
-                file_name = match[0] if match[0] else 'unknown_file'
-                file_id = match[1] if len(match) > 1 and match[1] else None
-                file_url = match[2] if len(match) > 2 and match[2] else None
-                
-                _log.info(f"[文件保存] CQ码文件: {file_name}, file_id={file_id}, url={file_url[:50] if file_url else '无'}...")
-                
-                # 如果没有 URL，尝试从 file_id 获取文件下载链接
-                if not file_url and file_id:
-                    # 使用 OneBot HTTP API 获取文件下载链接
-                    try:
-                        # 构造 OneBot API 请求
-                        # 参考: https://github.com/botuniverse/onebot-11/blob/master/api/public.md#get_file-
-                        api_url = "http://127.0.0.1:3000"  # 默认 OneBot HTTP 地址
-                        if is_group:
-                            endpoint = f"{api_url}/get_group_file_url"
-                            params = {"group_id": msg.group_id, "file_id": file_id}
-                        else:
-                            endpoint = f"{api_url}/get_private_file_url"
-                            params = {"user_id": msg.user_id, "file_id": file_id}
-                        
-                        _log.info(f"[文件保存] 尝试获取文件URL: {endpoint}")
-                        
-                        # 尝试使用 bot.api 的底层方法
-                        if hasattr(bot.api, '_request') or hasattr(bot.api, 'request'):
-                            # 尝试调用 OneBot API
-                            request_method = getattr(bot.api, '_request', getattr(bot.api, 'request', None))
-                            if request_method:
-                                file_info = request_method(endpoint, params=params)
-                                if file_info and 'data' in file_info and 'url' in file_info['data']:
-                                    file_url = file_info['data']['url']
-                                    _log.info(f"[文件保存] 通过API获取到文件URL: {file_url[:50]}...")
-                    except Exception as e:
-                        _log.warning(f"[文件保存] 获取文件下载链接失败: {e}")
-                    
-                    # 如果上面的方法失败，尝试直接通过 file_id 下载
-                    if not file_url:
-                        _log.info("[文件保存] 尝试直接使用 file_id 下载")
-                        # 某些协议支持直接通过 file_id 下载
-                        try:
-                            # 尝试从 ncatbot 配置中获取基础 URL
-                            from nbot.services.ai import base_url
-                            if base_url:
-                                # 构造可能的下载链接
-                                possible_urls = [
-                                    f"{base_url}/download_file?file_id={file_id}",
-                                    f"{base_url}/get_file?file_id={file_id}",
-                                ]
-                                for url in possible_urls:
-                                    try:
-                                        resp = head_sync(url, timeout=5)
-                                        if resp.status_code == 200:
-                                            file_url = url
-                                            _log.info(f"[文件保存] 找到可用下载链接: {file_url[:50]}...")
-                                            break
-                                    except:
-                                        continue
-                        except Exception as e:
-                            _log.debug(f"[文件保存] 尝试直接下载失败: {e}")
-                
-                if file_url:
-                    try:
-                        resp = get_sync(file_url, timeout=30)
-                        _log.info(f"[文件保存] 下载响应: {resp.status_code}")
-                        if resp.status_code == 200:
-                            result = workspace_manager.save_uploaded_file(
-                                session_id, resp.content, file_name, session_type)
-                            _log.info(f"[文件保存] 保存成功: {result}")
-                        else:
-                            _log.warning(f"[文件保存] 下载失败，状态码: {resp.status_code}")
-                    except Exception as e:
-                        _log.warning(f"[文件保存] 保存失败: {file_name}, {e}", exc_info=True)
-                else:
-                    _log.warning(f"[文件保存] 无法获取文件下载链接: {file_name}")
-        else:
-            _log.debug("[文件保存] raw_message 中没有 CQ:file 码")
-
-
-def _get_project_root() -> str:
-    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 from nbot.ai_commands import register_ai_commands
@@ -3988,294 +2899,6 @@ register_ai_commands(
     load_address=load_address,
 )
 
-
-async def dispatch_message(msg, is_group: bool):
-    """分发消息到命令处理器"""
-    raw_msg = msg.raw_message
-
-    if not raw_msg:
-        return
-
-    # 获取图片 URL - 优先使用 msg.message[0].data.url
-    image_url = None
-    try:
-        if hasattr(msg, 'message') and msg.message:
-            first_elem = msg.message[0]
-            if hasattr(first_elem, 'type') and first_elem.type == 'image':
-                image_url = first_elem.data.get('url')
-                if image_url:
-                    _log.info(f"从 message[0].data.url 获取图片 URL: {image_url[:50]}...")
-                else:
-                    _log.warning(f"message[0].type=image 但 data.url 为空, data keys={list(first_elem.data.keys()) if hasattr(first_elem, 'data') and hasattr(first_elem.data, 'keys') else 'N/A'}")
-            else:
-                elem_type = first_elem.type if hasattr(first_elem, 'type') else type(first_elem).__name__
-                _log.debug(f"message[0].type={elem_type}, 非图片消息, 不提取图片URL")
-        else:
-            _log.debug(f"msg 无 message 属性或为空, hasattr(message)={hasattr(msg, 'message')}, message={msg.message if hasattr(msg, 'message') else 'N/A'}")
-    except Exception as e:
-        _log.warning(f"无法从 message 获取图片 URL: {e}")
-
-    # 如果上面获取失败，尝试解析 CQ 码
-    if not image_url:
-        import re
-        # [CQ:image,file=...,sub_type=0,url=https://...] — url= 可能后有其他字段
-        # 使用 [^,\]]+ 在遇到 , 或 ] 时截断，防止吞入后续字段
-        image_match = re.search(r'\[CQ:image\b.*?url=(https?://[^,\]]+)', raw_msg)
-        if image_match:
-            image_url = image_match.group(1)
-            _log.info(f"从 CQ 码解析图片 URL: {image_url[:50]}...")
-        else:
-            # 只有 raw_msg 看起来像包含图片时才警告（避免纯文本消息的噪音日志）
-            if 'CQ:image' in raw_msg or '[图片]' in raw_msg or 'image' in raw_msg.lower():
-                _log.warning(f"消息疑似包含图片但未能提取URL, raw_msg={raw_msg[:200]}")
-
-    # 修复 HTML 实体编码（新版 QQ 协议的 URL 中 & 会被编码为 &amp; 等）
-    if image_url:
-        from html import unescape
-        unescaped = unescape(image_url)
-        if unescaped != image_url:
-            _log.info(f"URL HTML 实体已修复: &amp; → &")
-            image_url = unescaped
-
-    # 获取视频 URL
-    # 参考图片获取方式：优先 msg.message[].data 中的 url/file_id，回退 CQ 码正则
-    # QQ 视频消息的 data 包含 file（文件名）、url（本地路径）、可能还有 file_id（用于 API 下载）
-    video_url = None
-    video_file_id = None
-    try:
-        if hasattr(msg, 'message') and msg.message:
-            for i, elem in enumerate(msg.message):
-                elem_type = elem.type if hasattr(elem, 'type') else None
-                _log.info(f"  msg.message[{i}].type={elem_type}, has_data={hasattr(elem, 'data')}")
-                if elem_type == 'video':
-                    if hasattr(elem, 'data'):
-                        data_dict = dict(elem.data) if hasattr(elem.data, 'items') else {}
-                        _log.info(f"  视频元素 data: {json.dumps(data_dict, ensure_ascii=False, default=str)[:500]}")
-                        video_file_id = data_dict.get('file_id') or data_dict.get('file_unique') or data_dict.get('id')
-                    video_url = elem.data.get('url') or elem.data.get('file') or elem.data.get('path')
-                    if video_url:
-                        _log.info(f"从 message[{i}] 获取视频路径: {video_url[:100]}")
-                    if not video_url and video_file_id:
-                        _log.info(f"message[{i}] 视频无本地路径, 但有 file_id={video_file_id}, 将通过 API 下载")
-                    break
-    except Exception as e:
-        _log.warning(f"无法从 message 获取视频数据: {e}")
-        import traceback as _tb
-        _log.info(_tb.format_exc())
-
-    # CQ 码正则回退
-    if not video_url and not video_file_id:
-        import re
-        # [CQ:video,file=xxx.mp4,url=/local/path/xxx.mp4,file_size=...]
-        video_match = re.search(r'\[CQ:video\b.*?url=([^,\]]+)', raw_msg)
-        if video_match:
-            video_url = video_match.group(1)
-            _log.info(f"从 CQ 码 url= 提取到视频路径: {video_url[:100]}")
-        else:
-            video_match = re.search(r'\[CQ:video\b.*?file=([^,\]]+)', raw_msg)
-            if video_match:
-                video_url = video_match.group(1)
-                _log.info(f"从 CQ 码 file= 提取到视频文件名: {video_url[:100]}（仅有文件名）")
-
-    # 视频本地文件 → base64 data URL
-    # 参考图片：图片 URL 是 QQ CDN 的 HTTP 地址，可直接下载。视频是本地路径，需自己转换。
-    if video_url and not video_file_id:
-        from html import unescape
-        video_url = unescape(video_url)
-        _log.info(f"[视频] HTML 实体修复后: {video_url[:100]}")
-        if video_url.startswith("http://") or video_url.startswith("https://"):
-            _log.info(f"[视频] 远程 URL，直接使用")
-        else:
-            # 本地路径：尝试直接读取 → 失败则用 NapCat API 通过 file_id 下载
-            _log.info(f"[视频] 检测到本地文件路径，尝试转为 base64...")
-            import base64 as _b64
-            video_read = None
-            # 方式 A：直接读本地文件
-            try:
-                if os.path.exists(video_url):
-                    file_size = os.path.getsize(video_url)
-                    _log.info(f"[视频] 文件存在, 大小: {file_size//1024}KB")
-                    with open(video_url, "rb") as _f:
-                        video_read = _f.read()
-                else:
-                    _log.warning(f"[视频] 本地文件不存在（可能因 macOS 沙盒限制）: {video_url}")
-            except Exception as e:
-                _log.warning(f"[视频] 直接读取失败: {e}")
-
-            # 方式 B：尝试通过 NapCat WebSocket API 下载（如文件路径在 NapCat 可访问范围内）
-            if not video_read:
-                _log.info(f"[视频] 尝试通过 NapCat 协议下载文件...")
-                try:
-                    # NapCat 内部可访问 QQ 缓存，尝试通过 WebSocket 获取文件
-                    # 将本地路径作为参数传递给 NapCat
-                    import base64 as _b64_inner
-                    loop = asyncio.get_event_loop()
-                    # 尝试 get_file action（某些 NapCat 版本支持 file 参数）
-                    result = await bot.api._http.post("get_file", {"file": video_url})
-                    _log.info(f"[视频] NapCat API 响应: {json.dumps(result, ensure_ascii=False)[:300]}")
-                    if result and result.get("status") == "ok":
-                        file_data = result.get("data", {})
-                        if file_data.get("base64"):
-                            video_read = _b64_inner.b64decode(file_data["base64"])
-                        elif file_data.get("url"):
-                            # 如果是 HTTP URL，直接使用
-                            video_url = file_data["url"]
-                            video_read = b'__HTTP_URL__'
-                except Exception as e:
-                    _log.warning(f"[视频] NapCat API 下载失败: {e}")
-
-            if video_read and video_read != b'__HTTP_URL__':
-                _ext = os.path.splitext(video_url)[1].lower() if '.' in video_url else '.mp4'
-                _mime_map = {'.mp4': 'video/mp4', '.avi': 'video/x-msvideo', '.mov': 'video/quicktime', '.webm': 'video/webm'}
-                _mime = _mime_map.get(_ext, 'video/mp4')
-                _video_b64 = _b64.b64encode(video_read).decode("utf-8")
-                video_url = f"data:{_mime};base64,{_video_b64}"
-                _log.info(f"[视频] 已转 base64 data URL, 大小: {len(_video_b64)//1024}KB")
-            elif video_read == b'__HTTP_URL__':
-                _log.info(f"[视频] 使用 API 返回的 HTTP URL")
-            else:
-                _log.warning(f"[视频] 无法获取视频内容，video_url 置空")
-                video_url = None
-
-    # 有 file_id 但无文件内容时，尝试通过 NapCat API 获取
-    if video_file_id and not video_url:
-        _log.info(f"[视频] 尝试通过 file_id={video_file_id} 下载...")
-        try:
-            result = await bot.api._http.post("get_file", {"file_id": video_file_id})
-            _log.info(f"[视频] NapCat get_file 响应: {json.dumps(result, ensure_ascii=False)[:300]}")
-            if result and result.get("status") == "ok":
-                file_data = result.get("data", {})
-                if file_data.get("url"):
-                    video_url = file_data["url"]
-                    _log.info(f"[视频] 通过 file_id 获取到 URL: {video_url[:100]}")
-                elif file_data.get("base64"):
-                    import base64 as _b64
-                    video_read = _b64.b64decode(file_data["base64"])
-                    _video_b64 = _b64.b64encode(video_read).decode("utf-8")
-                    video_url = f"data:video/mp4;base64,{_video_b64}"
-                    _log.info(f"[视频] 通过 file_id 转 base64, 大小: {len(_video_b64)//1024}KB")
-        except Exception as e:
-            _log.warning(f"[视频] file_id 下载失败: {e}")
-    else:
-        _log.info(f"[视频] 未能提取到视频, video_url={video_url is not None}, video_file_id={video_file_id is not None}, raw_msg前200={raw_msg[:200]}")
-
-    # 检测并保存用户上传的文件到工作区
-    if WORKSPACE_AVAILABLE:
-        try:
-            _save_incoming_files_to_workspace(msg, is_group)
-        except Exception as e:
-            _log.warning(f"保存文件到工作区失败: {e}")
-
-    # B站链接检测（小程序分享 / BV号 / AV号 / b23.tv 短链）
-    try:
-        from nbot.plugins.bilibili_parser import on_bilibili_message
-        handled = await on_bilibili_message(msg, is_group)
-        if handled:
-            return
-    except Exception as e:
-        _log.warning(f"B站链接检测失败: {e}")
-
-    # 抖音链接检测（v.douyin.com 短链 / 小程序分享 / douyin.com/video）
-    try:
-        from nbot.plugins.douyin_parser import on_douyin_message
-        handled = await on_douyin_message(msg, is_group)
-        if handled:
-            return
-    except Exception as e:
-        _log.warning(f"抖音链接检测失败: {e}")
-
-    # 检查是否是命令
-    for commands, handler in command_handlers.items():
-        for cmd in commands:
-            if raw_msg.startswith(cmd):
-                try:
-                    await handler(msg, is_group)
-                except Exception as e:
-                    _log.error(f"Error handling command {cmd}: {e}")
-                return
-
-    # AI 聊天回复
-    loop = asyncio.get_event_loop()
-
-    if is_group:
-        # 群聊：@bot 必回；开启 auto_reply 后，未 @ 时按话痨程度概率回复。
-        group_id = str(msg.group_id) if hasattr(msg, 'group_id') else None
-        user_id = str(msg.user_id) if hasattr(msg, 'user_id') else None
-        at_bot = is_at_bot(msg)
-        auto_reply_enabled = False
-        auto_reply_level = 0.3
-
-        if group_id:
-            try:
-                auto_reply_enabled = switch.get_switch_state('auto_reply', group_id=group_id)
-                auto_reply_level = float(switch.group_switches.get(group_id, {}).get("auto_reply_level", 0.5))
-                auto_reply_level = max(0.0, min(auto_reply_level, 1.0))
-            except Exception as e:
-                _log.warning(f"Failed to read auto_reply config for group {group_id}: {e}")
-
-        if not at_bot and not auto_reply_enabled:
-            _log.debug(f"Group message ignored (not @bot): {raw_msg[:50]}...")
-            return
-
-        if not at_bot and random.random() > auto_reply_level:
-            _log.debug(f"Group auto_reply skipped by level={auto_reply_level:.2f}: {raw_msg[:50]}...")
-            return
-        
-        from nbot.services.chat_service import chat as do_chat
-        try:
-            content = raw_msg
-            atts = [{"type": "image", "url": image_url, "source": "qq"}] if image_url else []
-            if video_url:
-                atts.append({"type": "video", "url": video_url, "source": "qq"})
-            trigger = "at bot" if at_bot else f"auto_reply level={auto_reply_level:.2f}"
-            _log.info(f"Processing group message ({trigger}) from {user_id} in {group_id}: {content[:50]}..., image: {bool(image_url)}, video: {bool(video_url)}")
-
-            # 如果是 auto_reply 模式（非@机器人），获取群聊最近消息作为上下文
-            if not at_bot and auto_reply_enabled and group_id:
-                try:
-                    from nbot.ai_commands import get_group_history_items, history_items_to_text
-
-                    # 获取最近30条群聊消息作为上下文
-                    history_items = await get_group_history_items(int(group_id), 30)
-                    if history_items:
-                        # 格式化历史消息为文本
-                        history_text = history_items_to_text(history_items)
-                        # 在用户消息前添加群聊上下文，让AI能够理解对话背景
-                        user_prefix = f"用户{user_id}说："
-                        content = f"[群聊最近消息上下文]\n{history_text}\n[当前消息]\n{user_prefix}{content}"
-                        _log.info(f"Added group chat context with {len(history_items)} messages for auto_reply")
-                except Exception as ctx_err:
-                    _log.warning(f"Failed to get group history for context: {ctx_err}")
-
-            response = await loop.run_in_executor(None, do_chat, content, None, group_id, user_id, False, None, None, atts)
-            if response:
-                _log.info(f"Sending group reply: {response[:50]}...")
-                await msg.reply(text=response)
-            else:
-                _log.warning("No response from chat service")
-        except Exception as e:
-            _log.error(f"Error in group chat: {e}")
-            import traceback
-            _log.error(traceback.format_exc())
-    else:
-        from nbot.services.chat_service import chat as do_chat
-        try:
-            content = raw_msg
-            user_id = str(msg.user_id) if hasattr(msg, 'user_id') else None
-            atts = [{"type": "image", "url": image_url, "source": "qq"}] if image_url else []
-            if video_url:
-                atts.append({"type": "video", "url": video_url, "source": "qq"})
-            _log.info(f"Processing private message from {user_id}: {content[:50]}..., image: {bool(image_url)}, video: {bool(video_url)}")
-            response = await loop.run_in_executor(None, do_chat, content, user_id, None, None, False, None, None, atts)
-            if response:
-                _log.info(f"Sending private reply: {response[:50]}...")
-                await msg.reply(text=response)
-            else:
-                _log.warning("No response from chat service")
-        except Exception as e:
-            _log.error(f"Error in private chat: {e}")
-            import traceback
-            _log.error(traceback.format_exc())
 
 
 # 防止重复注册事件处理器
